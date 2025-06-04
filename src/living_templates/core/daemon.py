@@ -51,7 +51,11 @@ class FileWatcher(FileSystemEventHandler):
             if file_path in self.watched_files:
                 # Schedule rebuild for all nodes watching this file
                 for node_id in self.watched_files[file_path]:
-                    asyncio.create_task(self.daemon.rebuild_node_instances(node_id))
+                    if self.daemon.event_loop and not self.daemon.event_loop.is_closed():
+                        asyncio.run_coroutine_threadsafe(
+                            self.daemon.handle_file_change(node_id, file_path),
+                            self.daemon.event_loop
+                        )
 
 
 class LivingTemplatesDaemon:
@@ -76,6 +80,7 @@ class LivingTemplatesDaemon:
         # Runtime state
         self.running = False
         self.node_instances: Dict[str, List[NodeInstance]] = {}  # node_id -> instances
+        self.event_loop = None  # Store reference to the event loop
     
     async def initialize(self) -> None:
         """Initialize the daemon."""
@@ -90,6 +95,9 @@ class LivingTemplatesDaemon:
             return
         
         await self.initialize()
+        
+        # Store reference to the current event loop
+        self.event_loop = asyncio.get_running_loop()
         
         # Start file watching
         self.observer.schedule(self.file_watcher, "/", recursive=True)
@@ -142,6 +150,10 @@ class LivingTemplatesDaemon:
         # Store in database
         await self.db.store_node(node)
         
+        # Watch the config file itself for changes
+        if config_path.exists():
+            self.file_watcher.add_file_watch(str(config_path.resolve()), node_id)
+        
         return node_id
     
     async def unregister_node(self, node_id: str) -> None:
@@ -150,11 +162,18 @@ class LivingTemplatesDaemon:
         Args:
             node_id: ID of the node to unregister
         """
+        # Get node info before removing
+        node = await self.db.get_node(node_id)
+        
         # Remove all instances
         if node_id in self.node_instances:
             for instance in self.node_instances[node_id]:
                 await self._remove_instance(instance)
             del self.node_instances[node_id]
+        
+        # Remove config file watch
+        if node and node.config_path:
+            self.file_watcher.remove_file_watch(str(node.config_path.resolve()), node_id)
         
         # Remove from database
         await self.db.remove_node(node_id)
@@ -223,6 +242,44 @@ class LivingTemplatesDaemon:
         for instance in self.node_instances[node_id]:
             await self._build_instance(node, instance)
     
+    async def handle_file_change(self, node_id: str, file_path: str) -> None:
+        """Handle a file change event.
+        
+        Args:
+            node_id: ID of the node that watches this file
+            file_path: Path of the file that changed
+        """
+        node = await self.db.get_node(node_id)
+        if not node:
+            return
+        
+        # Check if this is the config file itself
+        if node.config_path and str(node.config_path.resolve()) == file_path:
+            # Config file changed - reload configuration and rebuild all instances
+            try:
+                # Reload configuration
+                config, content = self.config_manager.load_node_config(node.config_path)
+                
+                # Update node in database
+                updated_node = TemplateNode(
+                    id=node_id,
+                    config=config,
+                    config_path=node.config_path,
+                    created_at=node.created_at  # Preserve original creation time
+                )
+                await self.db.store_node(updated_node)
+                
+                # Rebuild all instances with new config
+                await self.rebuild_node_instances(node_id)
+                
+                print(f"Reloaded config and rebuilt instances for node {node_id}")
+                
+            except Exception as e:
+                print(f"Error reloading config for node {node_id}: {e}")
+        else:
+            # Input file changed - just rebuild instances
+            await self.rebuild_node_instances(node_id)
+    
     async def get_status(self) -> Dict[str, Any]:
         """Get daemon status."""
         nodes = await self.db.list_nodes()
@@ -240,6 +297,111 @@ class LivingTemplatesDaemon:
         """List all registered nodes."""
         return await self.db.list_nodes()
     
+    async def get_node_inputs(self, node_id: str) -> Dict[str, Any]:
+        """Get input information for a specific node.
+        
+        Args:
+            node_id: ID of the node
+            
+        Returns:
+            Dictionary containing input specifications and current instances
+        """
+        node = await self.db.get_node(node_id)
+        if not node:
+            raise ValueError(f"Node not found: {node_id}")
+        
+        # Get input specifications from node config
+        input_specs = {}
+        for input_name, input_spec in node.config.inputs.items():
+            input_specs[input_name] = {
+                "type": input_spec.type.value,
+                "description": input_spec.description,
+                "default": input_spec.default,
+                "required": input_spec.required
+            }
+        
+        # Get current instances and their input values
+        instances = []
+        if node_id in self.node_instances:
+            for instance in self.node_instances[node_id]:
+                instances.append({
+                    "instance_id": instance.id,
+                    "output_path": instance.output_path,
+                    "input_values": instance.input_values
+                })
+        
+        return {
+            "node_id": node_id,
+            "config_path": str(node.config_path) if node.config_path else None,
+            "input_specifications": input_specs,
+            "active_instances": instances
+        }
+    
+    async def get_watched_files(self, node_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get information about watched files.
+        
+        Args:
+            node_id: Optional node ID to filter by. If None, returns all watched files.
+            
+        Returns:
+            Dictionary containing watched file information
+        """
+        if node_id:
+            # Filter for specific node
+            watched_files = {}
+            for file_path, watching_nodes in self.file_watcher.watched_files.items():
+                if node_id in watching_nodes:
+                    watched_files[file_path] = [node_id]
+            
+            return {
+                "node_id": node_id,
+                "watched_files": watched_files,
+                "total_files": len(watched_files)
+            }
+        else:
+            # Return all watched files
+            return {
+                "watched_files": dict(self.file_watcher.watched_files),
+                "total_files": len(self.file_watcher.watched_files),
+                "total_watchers": sum(len(nodes) for nodes in self.file_watcher.watched_files.values())
+            }
+    
+    async def get_node_file_inputs(self, node_id: str) -> List[Dict[str, Any]]:
+        """Get file inputs for a specific node across all instances.
+        
+        Args:
+            node_id: ID of the node
+            
+        Returns:
+            List of file input information
+        """
+        node = await self.db.get_node(node_id)
+        if not node:
+            raise ValueError(f"Node not found: {node_id}")
+        
+        file_inputs = []
+        
+        # Check all instances of this node
+        if node_id in self.node_instances:
+            for instance in self.node_instances[node_id]:
+                for input_name, input_value in instance.input_values.items():
+                    input_spec = node.config.inputs.get(input_name)
+                    if input_spec and input_spec.type.value == "file":
+                        file_path = str(input_value) if isinstance(input_value, str) else str(input_value)
+                        file_exists = Path(file_path).exists() if isinstance(input_value, str) else False
+                        is_watched = file_path in self.file_watcher.watched_files
+                        
+                        file_inputs.append({
+                            "instance_id": instance.id,
+                            "input_name": input_name,
+                            "file_path": file_path,
+                            "exists": file_exists,
+                            "is_watched": is_watched,
+                            "output_path": instance.output_path
+                        })
+        
+        return file_inputs
+    
     def _generate_node_id(self, config_path: Path) -> str:
         """Generate a node ID from configuration path."""
         # Use hash of absolute path for consistent IDs
@@ -248,9 +410,24 @@ class LivingTemplatesDaemon:
     
     async def _load_existing_state(self) -> None:
         """Load existing nodes and instances from database."""
-        # This would load existing instances from the database
-        # For now, we'll start fresh each time
-        pass
+        # Load all nodes and set up config file watching
+        nodes = await self.db.list_nodes()
+        for node in nodes:
+            if node.config_path and node.config_path.exists():
+                self.file_watcher.add_file_watch(str(node.config_path.resolve()), node.id)
+        
+        # Load all instances and set up file watching
+        instances = await self.db.get_node_instances()
+        for instance in instances:
+            # Add to runtime state
+            if instance.node_id not in self.node_instances:
+                self.node_instances[instance.node_id] = []
+            self.node_instances[instance.node_id].append(instance)
+            
+            # Set up file watching for this instance
+            node = await self.db.get_node(instance.node_id)
+            if node:
+                await self._setup_file_watching(node, instance)
     
     async def _setup_file_watching(self, node: TemplateNode, instance: NodeInstance) -> None:
         """Set up file watching for an instance.
@@ -264,7 +441,9 @@ class LivingTemplatesDaemon:
             input_spec = node.config.inputs.get(input_name)
             if input_spec and input_spec.type.value == "file":
                 if isinstance(input_value, str) and Path(input_value).exists():
-                    self.file_watcher.add_file_watch(input_value, node.id)
+                    # Convert to absolute path for consistent watching
+                    abs_path = str(Path(input_value).resolve())
+                    self.file_watcher.add_file_watch(abs_path, node.id)
     
     async def _build_instance(self, node: TemplateNode, instance: NodeInstance) -> None:
         """Build/rebuild an instance.

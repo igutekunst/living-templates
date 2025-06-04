@@ -227,6 +227,165 @@ async def list_nodes(ctx: click.Context) -> None:
         sys.exit(1)
 
 
+@main.command('show-inputs')
+@click.argument('node_id')
+@click.pass_context
+@handle_async
+async def show_inputs(ctx: click.Context, node_id: str) -> None:
+    """Show input specifications and current values for a node."""
+    config_dir = ctx.obj.get('config_dir')
+    daemon_instance = LivingTemplatesDaemon(config_dir)
+    
+    try:
+        await daemon_instance.initialize()
+        input_info = await daemon_instance.get_node_inputs(node_id)
+        
+        console.print(f"[bold blue]Node:[/bold blue] {node_id}")
+        if input_info['config_path']:
+            console.print(f"[blue]Config:[/blue] {input_info['config_path']}")
+        
+        # Show input specifications
+        if input_info['input_specifications']:
+            console.print("\n[bold]Input Specifications:[/bold]")
+            spec_table = Table()
+            spec_table.add_column("Input Name", style="cyan")
+            spec_table.add_column("Type", style="magenta")
+            spec_table.add_column("Required", style="yellow")
+            spec_table.add_column("Default", style="green")
+            spec_table.add_column("Description", style="dim")
+            
+            for input_name, spec in input_info['input_specifications'].items():
+                required = "Yes" if spec['required'] else "No"
+                default = str(spec['default']) if spec['default'] is not None else "None"
+                description = spec['description'] or ""
+                
+                spec_table.add_row(
+                    input_name,
+                    spec['type'],
+                    required,
+                    default,
+                    description
+                )
+            
+            console.print(spec_table)
+        else:
+            console.print("[yellow]No input specifications defined[/yellow]")
+        
+        # Show active instances
+        if input_info['active_instances']:
+            console.print(f"\n[bold]Active Instances ({len(input_info['active_instances'])}):[/bold]")
+            for instance in input_info['active_instances']:
+                console.print(f"\n[cyan]Instance:[/cyan] {instance['instance_id']}")
+                console.print(f"[blue]Output:[/blue] {instance['output_path']}")
+                
+                if instance['input_values']:
+                    console.print("[green]Input Values:[/green]")
+                    for input_name, value in instance['input_values'].items():
+                        console.print(f"  {input_name}: {value}")
+                else:
+                    console.print("[yellow]No input values set[/yellow]")
+        else:
+            console.print("\n[yellow]No active instances[/yellow]")
+        
+    except Exception as e:
+        console.print(f"[red]Failed to show inputs: {e}[/red]")
+        sys.exit(1)
+
+
+@main.command('show-watched-files')
+@click.option('--node-id', help='Show watched files for specific node only')
+@click.pass_context
+@handle_async
+async def show_watched_files(ctx: click.Context, node_id: Optional[str]) -> None:
+    """Show files being watched by the daemon."""
+    config_dir = ctx.obj.get('config_dir')
+    daemon_instance = LivingTemplatesDaemon(config_dir)
+    
+    try:
+        await daemon_instance.initialize()
+        watch_info = await daemon_instance.get_watched_files(node_id)
+        
+        if node_id:
+            console.print(f"[bold blue]Watched Files for Node:[/bold blue] {node_id}")
+        else:
+            console.print("[bold blue]All Watched Files[/bold blue]")
+        
+        if not watch_info['watched_files']:
+            if node_id:
+                console.print(f"[yellow]No files being watched for node {node_id}[/yellow]")
+            else:
+                console.print("[yellow]No files being watched[/yellow]")
+            return
+        
+        table = Table()
+        table.add_column("File Path", style="cyan")
+        table.add_column("Watching Nodes", style="magenta")
+        table.add_column("Exists", style="green")
+        
+        for file_path, watching_nodes in watch_info['watched_files'].items():
+            exists = "Yes" if Path(file_path).exists() else "No"
+            nodes_str = ", ".join(watching_nodes)
+            
+            table.add_row(file_path, nodes_str, exists)
+        
+        console.print(table)
+        
+        if not node_id:
+            console.print(f"\n[blue]Total files watched:[/blue] {watch_info['total_files']}")
+            console.print(f"[blue]Total watchers:[/blue] {watch_info['total_watchers']}")
+        
+    except Exception as e:
+        console.print(f"[red]Failed to show watched files: {e}[/red]")
+        sys.exit(1)
+
+
+@main.command('show-file-inputs')
+@click.argument('node_id')
+@click.pass_context
+@handle_async
+async def show_file_inputs(ctx: click.Context, node_id: str) -> None:
+    """Show file inputs for a specific node."""
+    config_dir = ctx.obj.get('config_dir')
+    daemon_instance = LivingTemplatesDaemon(config_dir)
+    
+    try:
+        await daemon_instance.initialize()
+        file_inputs = await daemon_instance.get_node_file_inputs(node_id)
+        
+        console.print(f"[bold blue]File Inputs for Node:[/bold blue] {node_id}")
+        
+        if not file_inputs:
+            console.print("[yellow]No file inputs found for this node[/yellow]")
+            return
+        
+        table = Table()
+        table.add_column("Instance ID", style="cyan")
+        table.add_column("Input Name", style="magenta")
+        table.add_column("File Path", style="blue")
+        table.add_column("Exists", style="green")
+        table.add_column("Watched", style="yellow")
+        table.add_column("Output Path", style="dim")
+        
+        for file_input in file_inputs:
+            exists = "Yes" if file_input['exists'] else "No"
+            watched = "Yes" if file_input['is_watched'] else "No"
+            
+            table.add_row(
+                file_input['instance_id'][:8] + "...",  # Truncate instance ID
+                file_input['input_name'],
+                file_input['file_path'],
+                exists,
+                watched,
+                file_input['output_path']
+            )
+        
+        console.print(table)
+        
+    except Exception as e:
+        console.print(f"[red]Failed to show file inputs: {e}[/red]")
+        sys.exit(1)
+
+
 @main.command()
 @click.argument('config_file', type=click.Path(exists=True, path_type=Path))
 @click.pass_context

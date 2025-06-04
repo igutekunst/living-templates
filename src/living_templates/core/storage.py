@@ -229,6 +229,36 @@ class Database:
             ))
             await db.commit()
     
+    async def get_node_instances(self, node_id: Optional[str] = None) -> List[NodeInstance]:
+        """Get node instances, optionally filtered by node_id."""
+        instances = []
+        async with aiosqlite.connect(self.db_path) as db:
+            if node_id:
+                query = """
+                    SELECT id, node_id, input_config, output_path, created_at
+                    FROM node_instances WHERE node_id = ?
+                    ORDER BY created_at
+                """
+                params = (node_id,)
+            else:
+                query = """
+                    SELECT id, node_id, input_config, output_path, created_at
+                    FROM node_instances
+                    ORDER BY created_at
+                """
+                params = ()
+            
+            async with db.execute(query, params) as cursor:
+                async for row in cursor:
+                    instances.append(NodeInstance(
+                        id=row[0],
+                        node_id=row[1],
+                        input_values=json.loads(row[2]),
+                        output_path=row[3],
+                        created_at=datetime.fromisoformat(row[4])
+                    ))
+        return instances
+    
     async def store_node_value(self, value: NodeValue) -> None:
         """Store a node output value."""
         async with aiosqlite.connect(self.db_path) as db:
