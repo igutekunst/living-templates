@@ -2,20 +2,50 @@
 
 A reactive file system that automatically updates generated files when their dependencies change. Think of it as "functional reactive programming for files" or a "living Makefile" that watches your filesystem and keeps everything in sync.
 
+## Current Implementation Status
+
+**✅ Currently Implemented:**
+- **Template Nodes**: Jinja2 templates that render to files with file watching
+- **Basic File Watching**: Automatic regeneration when template files or file inputs change
+- **Content-Addressed Storage**: Generated content stored with symlinks to target locations
+- **YAML Frontmatter Configuration**: Template configuration via YAML frontmatter
+- **CLI Interface**: Basic commands for registration, instance creation, and daemon management
+- **SQLite Database**: Metadata storage for nodes, instances, and dependencies
+- **HTTP API**: Basic REST API for daemon communication (not fully daemonized)
+
+**🚧 Partially Implemented:**
+- **Daemon Process**: Runs as a process but not truly daemonized (no background fork/detach)
+- **Input Types**: Basic support for string, integer, boolean, array, object, and file types
+- **Template Engine**: Only Jinja2 is implemented with custom filters (`read_file`, `now`, `env`)
+
+**📋 Planned/Not Yet Implemented:**
+- **Program Nodes**: Scripts/commands that process inputs and generate outputs
+- **API Nodes**: External data sources (REST APIs, databases)  
+- **Environment Nodes**: System environment variables as reactive inputs
+- **Webhook Nodes**: HTTP webhook triggers
+- **Node References**: `@node-id.output` syntax for inter-node dependencies
+- **Output Modes**: append, prepend, concatenate modes (only replace works)
+- **Tail Mode**: Monitoring file changes and streaming new content
+- **True Daemonization**: Background process with proper daemon behavior
+- **Dependency Graph Visualization**: `living-templates graph` command
+- **Additional Template Engines**: Beyond Jinja2
+- **Sandboxed Execution**: Security for program nodes
+- **Parallel Processing**: For independent nodes
+
 ## Core Concept
 
-Living Templates creates a dependency graph where files, templates, and computational processes automatically regenerate their outputs when inputs change. It's like having a build system that runs continuously in the background, ensuring your generated content is always up-to-date.
+Living Templates creates a dependency graph where files, templates, and computational processes automatically regenerate their outputs when inputs change. Currently, this works for basic Jinja2 templates with file dependencies.
 
 ## Architecture Overview
 
-### Node-Based System
-- **Template Nodes**: Jinja2 templates that render to files
-- **Program Nodes**: Scripts/commands that process inputs and generate outputs  
-- **File Nodes**: Raw file dependencies that trigger updates
-- **API Nodes**: External data sources (REST APIs, databases)
-- **Environment Nodes**: System environment variables
+### Node-Based System (Current: Template Nodes Only)
+- **Template Nodes**: ✅ Jinja2 templates that render to files
+- **Program Nodes**: 📋 Scripts/commands that process inputs and generate outputs  
+- **File Nodes**: 📋 Raw file dependencies that trigger updates
+- **API Nodes**: 📋 External data sources (REST APIs, databases)
+- **Environment Nodes**: 📋 System environment variables
 
-### Centralized Store with Symlinks
+### Centralized Store with Symlinks ✅
 Generated content is stored in a content-addressed store (similar to Nix), with symlinks pointing to the actual locations where files are needed:
 
 ```
@@ -29,7 +59,7 @@ Generated content is stored in a content-addressed store (similar to Nix), with 
 └── daemon.pid             # Daemon process info
 ```
 
-### YAML Frontmatter Configuration
+### YAML Frontmatter Configuration ✅
 Any file can become a living template by adding YAML frontmatter that declares its inputs, outputs, and processing logic:
 
 ```yaml
@@ -50,7 +80,7 @@ inputs:
       type: string
 outputs:
   - config.json
-dependencies:
+dependencies:  # 📋 Not yet implemented
   - ./base-config.yaml
   - @api-node.database_info
 ---
@@ -66,7 +96,7 @@ dependencies:
 
 ## Usage Examples
 
-### Basic Template Registration and Linking
+### Basic Template Registration and Linking ✅
 
 1. **Create a template file** (`app-config.yaml`):
 ```yaml
@@ -107,7 +137,7 @@ lt -s app-config.yaml /path/to/my-app/config.json \
   --config my-app-inputs.yaml
 ```
 
-### Program Node Example
+### Program Node Example 📋 (Planned)
 
 ```python
 #!/usr/bin/env python3
@@ -152,7 +182,7 @@ if __name__ == "__main__":
     main()
 ```
 
-### Complex Dependency Chain
+### Complex Dependency Chain 📋 (Planned)
 
 ```yaml
 # docs-generator.yaml
@@ -189,7 +219,7 @@ outputs:
 *Generated on {{ now() }}*
 ```
 
-## Advanced Features
+## Advanced Features (Planned) 📋
 
 ### Concatenation Mode
 Files can be configured to concatenate new content rather than replace:
@@ -247,40 +277,43 @@ transform: |
 
 ## CLI Reference
 
-### Core Commands
+### Core Commands ✅
 
 ```bash
-# Daemon Management
+# Daemon Management (partially implemented - not truly daemonized)
 living-templates daemon start
 living-templates daemon stop
 living-templates daemon status
-living-templates daemon restart
 
-# Node Registration
+# Node Registration ✅
 living-templates register <config-file>
 living-templates unregister <config-file>
 living-templates list-nodes
 
-# Instance Management (short form: lt)
+# Instance Management (short form: lt) ✅
 lt -s <template> <output-path> [options]
 lt --source <template> <output-path> [options]
 
 # Options for lt command:
---input key=value          # Set input values
---config <config-file>     # Load inputs from YAML/JSON file
---force                    # Force regeneration
---dry-run                  # Show what would be generated
+--input key=value          # Set input values ✅
+--config <config-file>     # Load inputs from YAML/JSON file ✅
+--force                    # Force regeneration ✅
+--dry-run                  # Show what would be generated ✅
 
-# Inspection and Debugging
-living-templates status                    # Show all active instances
+# Inspection and Debugging (partially implemented)
+living-templates status                    # Show daemon status ✅
+living-templates show-inputs <node-id>     # Show node inputs ✅
+living-templates show-watched-files        # Show watched files ✅
+living-templates validate <config-file>    # Validate configuration ✅
+
+# Planned commands 📋
 living-templates graph                     # Visualize dependency graph
 living-templates graph --node <node-id>   # Show specific node dependencies
 living-templates rebuild [node-id]        # Force rebuild specific node
 living-templates logs [node-id]           # Show processing logs
-living-templates validate <config-file>   # Validate configuration
 ```
 
-### Input Configuration Files
+### Input Configuration Files ✅
 
 For complex inputs, use YAML or JSON configuration files:
 
@@ -307,38 +340,38 @@ lt -s app-template.yaml /deploy/config.json --config my-app-config.yaml
 
 ## Schema Definition
 
-### Meta-Schema
+### Meta-Schema ✅
 All frontmatter must conform to the living-templates meta-schema:
 
 ```yaml
-schema_version: "1.0"  # Required
-node_type: string      # Required: template, program, tail, etc.
-inputs:               # Optional: input definitions
+schema_version: "1.0"  # Required ✅
+node_type: string      # Required: template (✅), program (📋), tail (📋), etc.
+inputs:               # Optional: input definitions ✅
   <input_name>:
-    type: string       # string, integer, number, boolean, array, object, file
-    description: string
-    default: any
-    required: boolean
-    source: string     # Reference to another node: "@node-id.output"
-outputs:              # Required: list of output files
+    type: string       # string, integer, number, boolean, array, object, file ✅
+    description: string ✅
+    default: any ✅
+    required: boolean ✅
+    source: string     # Reference to another node: "@node-id.output" 📋
+outputs:              # Required: list of output files ✅
   - string
-dependencies:         # Optional: explicit dependencies
+dependencies:         # Optional: explicit dependencies 📋
   - string            # File paths or node references
-template_engine: string  # For template nodes: jinja2, etc.
-output_mode: string   # replace (default), append, prepend, concatenate
-input_mode: string    # normal (default), tail
-transform: string     # For program nodes: inline code or script path
+template_engine: string  # For template nodes: jinja2 ✅, others 📋
+output_mode: string   # replace (✅), append (📋), prepend (📋), concatenate (📋)
+input_mode: string    # normal (✅), tail (📋)
+transform: string     # For program nodes: inline code or script path 📋
 ```
 
-### Input Types
-- **string**: Text values
-- **integer/number**: Numeric values  
-- **boolean**: true/false values
-- **array**: Lists of values
-- **object**: Nested key-value structures
-- **file**: File path references (triggers file watching)
+### Input Types ✅
+- **string**: Text values ✅
+- **integer/number**: Numeric values ✅
+- **boolean**: true/false values ✅
+- **array**: Lists of values ✅
+- **object**: Nested key-value structures ✅
+- **file**: File path references (triggers file watching) ✅
 
-### Node References
+### Node References 📋 (Planned)
 Reference outputs from other nodes using `@node-id.output_name` syntax:
 - `@api-fetcher.user_data`
 - `@config-parser.database_settings`
@@ -346,39 +379,40 @@ Reference outputs from other nodes using `@node-id.output_name` syntax:
 
 ## Implementation Notes
 
-### Technology Stack
+### Technology Stack ✅
 - **Python 3.8+** with asyncio for the daemon
 - **SQLite** for dependency graph and metadata storage
 - **Watchdog** for file system monitoring
 - **Jinja2** for template rendering
 - **Pydantic** for schema validation
 - **Click** for CLI interface
+- **aiohttp** for HTTP API server
 
 ### Performance Considerations
-- Content-addressed storage prevents duplicate work
-- Incremental updates only rebuild changed dependencies
-- Configurable debouncing for rapid file changes
-- Parallel processing for independent nodes
+- Content-addressed storage prevents duplicate work ✅
+- Incremental updates only rebuild changed dependencies ✅
+- Configurable debouncing for rapid file changes 📋
+- Parallel processing for independent nodes 📋
 
-### Security
+### Security 📋 (Planned)
 - Sandboxed execution for program nodes
-- Input validation against declared schemas
+- Input validation against declared schemas ✅
 - Configurable file system access restrictions
 - Audit logging for all operations
 
 ## Use Cases
 
-### Development Workflows
+### Development Workflows ✅ (Basic template support)
 - **Configuration Management**: Generate environment-specific configs
-- **Documentation**: Auto-update docs from code comments and API specs
+- **Documentation**: Auto-update docs from templates
 - **Code Generation**: Create boilerplate from templates and schemas
 
-### Data Processing
+### Data Processing 📋 (Planned)
 - **ETL Pipelines**: Transform data as sources update
 - **Report Generation**: Create reports from live data sources
 - **Log Processing**: Parse and aggregate log files in real-time
 
-### System Administration
+### System Administration 📋 (Planned)
 - **Config Deployment**: Push configuration changes across environments
 - **Monitoring**: Generate dashboards from system metrics
 - **Backup Orchestration**: Coordinate backup processes across services
@@ -395,7 +429,7 @@ pip install living-templates
 living-templates daemon start
 ```
 
-3. **Create your first template** (see examples above)
+3. **Create your first template** (see examples/ directory)
 
 4. **Register and link it**:
 ```bash
@@ -408,11 +442,15 @@ lt -s my-template.yaml ./output.txt --input name="World"
 ## Contributing
 
 This project is in active development. Key areas for contribution:
-- Additional template engines
-- New node types (database, API, etc.)
-- Performance optimizations
-- Security enhancements
-- Documentation and examples
+- **Program node implementation** (high priority)
+- **True daemon process** (background fork/detach)
+- **Node reference system** (`@node-id.output` syntax)
+- **Additional template engines**
+- **Output modes** (append, prepend, concatenate)
+- **Tail mode** for file monitoring
+- **Performance optimizations**
+- **Security enhancements**
+- **Documentation and examples**
 
 ## License
 
