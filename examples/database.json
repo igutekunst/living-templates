@@ -1,8 +1,8 @@
 {
   "host": "localhost",
   "port": 5432,
-  "database": "myapp_final_test",
+  "database": "myapp_production_ready",
   "username": "app_user",
   "ssl": true,
-  "pool_size": 30
+  "pool_size": 50
 } 

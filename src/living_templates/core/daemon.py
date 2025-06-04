@@ -2,12 +2,14 @@
 
 import asyncio
 import hashlib
+import json
 import os
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from aiohttp import web
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
@@ -77,6 +79,11 @@ class LivingTemplatesDaemon:
         self.file_watcher = FileWatcher(self)
         self.observer = Observer()
         
+        # API server
+        self.app = None
+        self.api_server = None
+        self.api_port = 8765  # Default port for API
+        
         # Runtime state
         self.running = False
         self.node_instances: Dict[str, List[NodeInstance]] = {}  # node_id -> instances
@@ -99,6 +106,9 @@ class LivingTemplatesDaemon:
         # Store reference to the current event loop
         self.event_loop = asyncio.get_running_loop()
         
+        # Start API server
+        await self._start_api_server()
+        
         # Start file watching
         self.observer.schedule(self.file_watcher, "/", recursive=True)
         self.observer.start()
@@ -115,6 +125,10 @@ class LivingTemplatesDaemon:
             return
         
         self.running = False
+        
+        # Stop API server
+        if self.api_server:
+            await self.api_server.cleanup()
         
         # Stop file watching
         self.observer.stop()
@@ -389,7 +403,10 @@ class LivingTemplatesDaemon:
                     if input_spec and input_spec.type.value == "file":
                         file_path = str(input_value) if isinstance(input_value, str) else str(input_value)
                         file_exists = Path(file_path).exists() if isinstance(input_value, str) else False
-                        is_watched = file_path in self.file_watcher.watched_files
+                        
+                        # Check if file is watched by comparing absolute paths
+                        abs_file_path = str(Path(file_path).resolve()) if isinstance(input_value, str) else file_path
+                        is_watched = abs_file_path in self.file_watcher.watched_files
                         
                         file_inputs.append({
                             "instance_id": instance.id,
@@ -555,4 +572,141 @@ class LivingTemplatesDaemon:
                 input_spec = node.config.inputs.get(input_name)
                 if input_spec and input_spec.type.value == "file":
                     if isinstance(input_value, str):
-                        self.file_watcher.remove_file_watch(input_value, node.id) 
+                        self.file_watcher.remove_file_watch(input_value, node.id)
+    
+    async def _start_api_server(self) -> None:
+        """Start the HTTP API server."""
+        self.app = web.Application()
+        
+        # Add routes
+        self.app.router.add_get('/api/status', self._api_get_status)
+        self.app.router.add_get('/api/nodes', self._api_list_nodes)
+        self.app.router.add_get('/api/nodes/{node_id}/inputs', self._api_get_node_inputs)
+        self.app.router.add_get('/api/nodes/{node_id}/file-inputs', self._api_get_node_file_inputs)
+        self.app.router.add_get('/api/watched-files', self._api_get_watched_files)
+        self.app.router.add_get('/api/watched-files/{node_id}', self._api_get_watched_files_for_node)
+        
+        # Start server
+        runner = web.AppRunner(self.app)
+        await runner.setup()
+        site = web.TCPSite(runner, 'localhost', self.api_port)
+        await site.start()
+        self.api_server = runner
+    
+    async def _api_get_status(self, request: web.Request) -> web.Response:
+        """API endpoint: Get daemon status."""
+        status = await self.get_status()
+        return web.json_response(status)
+    
+    async def _api_list_nodes(self, request: web.Request) -> web.Response:
+        """API endpoint: List all nodes."""
+        nodes = await self.list_nodes()
+        nodes_data = []
+        for node in nodes:
+            nodes_data.append({
+                "id": node.id,
+                "config_path": str(node.config_path) if node.config_path else None,
+                "node_type": node.config.node_type.value,
+                "outputs": node.config.outputs,
+                "created_at": node.created_at.isoformat() if node.created_at else None
+            })
+        return web.json_response({"nodes": nodes_data})
+    
+    async def _api_get_node_inputs(self, request: web.Request) -> web.Response:
+        """API endpoint: Get node inputs."""
+        node_id = request.match_info['node_id']
+        try:
+            inputs_data = await self.get_node_inputs(node_id)
+            return web.json_response(inputs_data)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=404)
+    
+    async def _api_get_node_file_inputs(self, request: web.Request) -> web.Response:
+        """API endpoint: Get node file inputs."""
+        node_id = request.match_info['node_id']
+        try:
+            file_inputs = await self.get_node_file_inputs(node_id)
+            return web.json_response({"file_inputs": file_inputs})
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=404)
+    
+    async def _api_get_watched_files(self, request: web.Request) -> web.Response:
+        """API endpoint: Get all watched files."""
+        watched_data = await self.get_watched_files()
+        return web.json_response(watched_data)
+    
+    async def _api_get_watched_files_for_node(self, request: web.Request) -> web.Response:
+        """API endpoint: Get watched files for a specific node."""
+        node_id = request.match_info['node_id']
+        watched_data = await self.get_watched_files(node_id)
+        return web.json_response(watched_data)
+
+
+class DaemonClient:
+    """Client for connecting to the running daemon API."""
+    
+    def __init__(self, port: int = 8765):
+        """Initialize daemon client.
+        
+        Args:
+            port: Port the daemon API is running on
+        """
+        self.base_url = f"http://localhost:{port}/api"
+        self.session = None
+    
+    async def __aenter__(self):
+        """Async context manager entry."""
+        import aiohttp
+        self.session = aiohttp.ClientSession()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        if self.session:
+            await self.session.close()
+    
+    async def is_daemon_running(self) -> bool:
+        """Check if daemon is running and accessible."""
+        import aiohttp
+        try:
+            async with self.session.get(f"{self.base_url}/status", timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                return resp.status == 200
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return False
+    
+    async def get_status(self) -> Dict[str, Any]:
+        """Get daemon status."""
+        async with self.session.get(f"{self.base_url}/status") as resp:
+            resp.raise_for_status()
+            return await resp.json()
+    
+    async def list_nodes(self) -> List[Dict[str, Any]]:
+        """List all nodes."""
+        async with self.session.get(f"{self.base_url}/nodes") as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            return data["nodes"]
+    
+    async def get_node_inputs(self, node_id: str) -> Dict[str, Any]:
+        """Get node inputs."""
+        async with self.session.get(f"{self.base_url}/nodes/{node_id}/inputs") as resp:
+            resp.raise_for_status()
+            return await resp.json()
+    
+    async def get_node_file_inputs(self, node_id: str) -> List[Dict[str, Any]]:
+        """Get node file inputs."""
+        async with self.session.get(f"{self.base_url}/nodes/{node_id}/file-inputs") as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            return data["file_inputs"]
+    
+    async def get_watched_files(self, node_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get watched files."""
+        if node_id:
+            url = f"{self.base_url}/watched-files/{node_id}"
+        else:
+            url = f"{self.base_url}/watched-files"
+        
+        async with self.session.get(url) as resp:
+            resp.raise_for_status()
+            return await resp.json() 

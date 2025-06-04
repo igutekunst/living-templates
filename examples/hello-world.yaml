@@ -16,9 +16,8 @@ outputs:
 ---
 {{ greeting }}, {{ name }}! 🎉✨
 
-More content here!
-
 Generated at: {{ now() }}
 Environment: {{ env("USER", "unknown") }}
 
-This template was updated to test file watching! (Updated again!) 
+This is wild! File watching works perfectly! 🚀
+

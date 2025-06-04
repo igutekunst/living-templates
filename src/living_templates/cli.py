@@ -15,7 +15,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from .core.daemon import LivingTemplatesDaemon
+from .core.daemon import LivingTemplatesDaemon, DaemonClient
 from .core.config import ConfigManager
 from .core.models import NodeType
 from .core.storage import ContentStore
@@ -191,6 +191,50 @@ async def unregister(ctx: click.Context, node_id: str) -> None:
 @handle_async
 async def list_nodes(ctx: click.Context) -> None:
     """List all registered nodes."""
+    # Try to connect to running daemon first
+    async with DaemonClient() as client:
+        if await client.is_daemon_running():
+            try:
+                nodes_data = await client.list_nodes()
+                
+                if not nodes_data:
+                    console.print("[yellow]No nodes registered[/yellow]")
+                    return
+                
+                table = Table(title="Registered Nodes")
+                table.add_column("Node ID", style="cyan")
+                table.add_column("Type", style="magenta")
+                table.add_column("Config File", style="blue")
+                table.add_column("Outputs", style="green")
+                table.add_column("Created", style="yellow")
+                
+                for node_data in nodes_data:
+                    outputs_str = ", ".join(node_data.get("outputs", []))
+                    created_str = node_data.get("created_at", "Unknown")
+                    if created_str != "Unknown":
+                        # Format the datetime string
+                        from datetime import datetime
+                        try:
+                            dt = datetime.fromisoformat(created_str.replace('Z', '+00:00'))
+                            created_str = dt.strftime("%Y-%m-%d %H:%M")
+                        except:
+                            pass
+                    
+                    table.add_row(
+                        node_data["id"],
+                        node_data.get("node_type", "unknown"),
+                        node_data.get("config_path", "Unknown"),
+                        outputs_str,
+                        created_str
+                    )
+                
+                console.print(table)
+                return
+            except Exception as e:
+                console.print(f"[red]Error connecting to daemon: {e}[/red]")
+                console.print("[yellow]Falling back to database query...[/yellow]")
+    
+    # Fallback to direct database access
     config_dir = ctx.obj.get('config_dir')
     daemon_instance = LivingTemplatesDaemon(config_dir)
     
@@ -207,23 +251,24 @@ async def list_nodes(ctx: click.Context) -> None:
         table.add_column("Type", style="magenta")
         table.add_column("Config File", style="blue")
         table.add_column("Outputs", style="green")
-        table.add_column("Created", style="dim")
+        table.add_column("Created", style="yellow")
         
         for node in nodes:
-            outputs = ", ".join(node.config.outputs)
-            config_path = str(node.config_path) if node.config_path else "N/A"
+            outputs_str = ", ".join(node.config.outputs)
+            created_str = node.created_at.strftime("%Y-%m-%d %H:%M") if node.created_at else "Unknown"
+            
             table.add_row(
                 node.id,
                 node.config.node_type.value,
-                config_path,
-                outputs,
-                node.created_at.strftime("%Y-%m-%d %H:%M")
+                str(node.config_path) if node.config_path else "Unknown",
+                outputs_str,
+                created_str
             )
         
         console.print(table)
         
     except Exception as e:
-        console.print(f"[red]Failed to list nodes: {e}[/red]")
+        console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
 
 
@@ -233,62 +278,120 @@ async def list_nodes(ctx: click.Context) -> None:
 @handle_async
 async def show_inputs(ctx: click.Context, node_id: str) -> None:
     """Show input specifications and current values for a node."""
+    # Try to connect to running daemon first
+    async with DaemonClient() as client:
+        if await client.is_daemon_running():
+            try:
+                inputs_data = await client.get_node_inputs(node_id)
+                
+                console.print(f"[bold cyan]Node:[/bold cyan] {inputs_data['node_id']}")
+                if inputs_data.get('config_path'):
+                    console.print(f"[bold blue]Config:[/bold blue] {inputs_data['config_path']}")
+                console.print()
+                
+                # Show input specifications
+                if inputs_data.get('input_specifications'):
+                    console.print("[bold green]Input Specifications:[/bold green]")
+                    spec_table = Table()
+                    spec_table.add_column("Input Name", style="cyan")
+                    spec_table.add_column("Type", style="magenta")
+                    spec_table.add_column("Required", style="yellow")
+                    spec_table.add_column("Default", style="blue")
+                    spec_table.add_column("Description", style="white")
+                    
+                    for input_name, spec in inputs_data['input_specifications'].items():
+                        required_str = "Yes" if spec.get('required', False) else "No"
+                        default_str = str(spec.get('default', '')) if spec.get('default') is not None else ""
+                        
+                        spec_table.add_row(
+                            input_name,
+                            spec.get('type', 'unknown'),
+                            required_str,
+                            default_str,
+                            spec.get('description', '')
+                        )
+                    
+                    console.print(spec_table)
+                    console.print()
+                
+                # Show active instances
+                if inputs_data.get('active_instances'):
+                    console.print("[bold green]Active Instances:[/bold green]")
+                    for instance in inputs_data['active_instances']:
+                        console.print(f"[bold yellow]Instance:[/bold yellow] {instance['instance_id']}")
+                        console.print(f"[bold blue]Output:[/bold blue] {instance['output_path']}")
+                        
+                        if instance.get('input_values'):
+                            console.print("[bold green]Input Values:[/bold green]")
+                            for input_name, value in instance['input_values'].items():
+                                console.print(f"  {input_name}: {value}")
+                        console.print()
+                else:
+                    console.print("[yellow]No active instances[/yellow]")
+                
+                return
+            except Exception as e:
+                console.print(f"[red]Error connecting to daemon: {e}[/red]")
+                console.print("[yellow]Falling back to database query...[/yellow]")
+    
+    # Fallback to direct database access
     config_dir = ctx.obj.get('config_dir')
     daemon_instance = LivingTemplatesDaemon(config_dir)
     
     try:
         await daemon_instance.initialize()
-        input_info = await daemon_instance.get_node_inputs(node_id)
+        inputs_data = await daemon_instance.get_node_inputs(node_id)
         
-        console.print(f"[bold blue]Node:[/bold blue] {node_id}")
-        if input_info['config_path']:
-            console.print(f"[blue]Config:[/blue] {input_info['config_path']}")
+        console.print(f"[bold cyan]Node:[/bold cyan] {inputs_data['node_id']}")
+        if inputs_data.get('config_path'):
+            console.print(f"[bold blue]Config:[/bold blue] {inputs_data['config_path']}")
+        console.print()
         
         # Show input specifications
-        if input_info['input_specifications']:
-            console.print("\n[bold]Input Specifications:[/bold]")
+        if inputs_data.get('input_specifications'):
+            console.print("[bold green]Input Specifications:[/bold green]")
             spec_table = Table()
             spec_table.add_column("Input Name", style="cyan")
             spec_table.add_column("Type", style="magenta")
             spec_table.add_column("Required", style="yellow")
-            spec_table.add_column("Default", style="green")
-            spec_table.add_column("Description", style="dim")
+            spec_table.add_column("Default", style="blue")
+            spec_table.add_column("Description", style="white")
             
-            for input_name, spec in input_info['input_specifications'].items():
-                required = "Yes" if spec['required'] else "No"
-                default = str(spec['default']) if spec['default'] is not None else "None"
-                description = spec['description'] or ""
+            for input_name, spec in inputs_data['input_specifications'].items():
+                required_str = "Yes" if spec.get('required', False) else "No"
+                default_str = str(spec.get('default', '')) if spec.get('default') is not None else ""
                 
                 spec_table.add_row(
                     input_name,
-                    spec['type'],
-                    required,
-                    default,
-                    description
+                    spec.get('type', 'unknown'),
+                    required_str,
+                    default_str,
+                    spec.get('description', '')
                 )
             
             console.print(spec_table)
-        else:
-            console.print("[yellow]No input specifications defined[/yellow]")
+            console.print()
         
         # Show active instances
-        if input_info['active_instances']:
-            console.print(f"\n[bold]Active Instances ({len(input_info['active_instances'])}):[/bold]")
-            for instance in input_info['active_instances']:
-                console.print(f"\n[cyan]Instance:[/cyan] {instance['instance_id']}")
-                console.print(f"[blue]Output:[/blue] {instance['output_path']}")
+        if inputs_data.get('active_instances'):
+            console.print("[bold green]Active Instances:[/bold green]")
+            for instance in inputs_data['active_instances']:
+                console.print(f"[bold yellow]Instance:[/bold yellow] {instance['instance_id']}")
+                console.print(f"[bold blue]Output:[/bold blue] {instance['output_path']}")
                 
-                if instance['input_values']:
-                    console.print("[green]Input Values:[/green]")
+                if instance.get('input_values'):
+                    console.print("[bold green]Input Values:[/bold green]")
                     for input_name, value in instance['input_values'].items():
                         console.print(f"  {input_name}: {value}")
-                else:
-                    console.print("[yellow]No input values set[/yellow]")
+                console.print()
         else:
-            console.print("\n[yellow]No active instances[/yellow]")
+            console.print("[yellow]No active instances[/yellow]")
         
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
     except Exception as e:
-        console.print(f"[red]Failed to show inputs: {e}[/red]")
+        console.print(f"[red]Unexpected error: {e}[/red]")
         sys.exit(1)
 
 
@@ -298,44 +401,73 @@ async def show_inputs(ctx: click.Context, node_id: str) -> None:
 @handle_async
 async def show_watched_files(ctx: click.Context, node_id: Optional[str]) -> None:
     """Show files being watched by the daemon."""
+    # Try to connect to running daemon first
+    async with DaemonClient() as client:
+        if await client.is_daemon_running():
+            try:
+                watched_data = await client.get_watched_files(node_id)
+                
+                if node_id:
+                    console.print(f"[bold cyan]Watched files for node:[/bold cyan] {node_id}")
+                else:
+                    console.print("[bold cyan]All watched files[/bold cyan]")
+                
+                console.print(f"[bold blue]Total files:[/bold blue] {watched_data.get('total_files', 0)}")
+                if not node_id and 'total_watchers' in watched_data:
+                    console.print(f"[bold blue]Total watchers:[/bold blue] {watched_data['total_watchers']}")
+                console.print()
+                
+                if watched_data.get('watched_files'):
+                    table = Table()
+                    table.add_column("File Path", style="green")
+                    table.add_column("Watching Nodes", style="cyan")
+                    
+                    for file_path, watching_nodes in watched_data['watched_files'].items():
+                        nodes_str = ", ".join(watching_nodes)
+                        table.add_row(file_path, nodes_str)
+                    
+                    console.print(table)
+                else:
+                    console.print("[yellow]No files are being watched[/yellow]")
+                
+                return
+            except Exception as e:
+                console.print(f"[red]Error connecting to daemon: {e}[/red]")
+                console.print("[yellow]Falling back to database query...[/yellow]")
+    
+    # Fallback to direct database access
     config_dir = ctx.obj.get('config_dir')
     daemon_instance = LivingTemplatesDaemon(config_dir)
     
     try:
         await daemon_instance.initialize()
-        watch_info = await daemon_instance.get_watched_files(node_id)
+        watched_data = await daemon_instance.get_watched_files(node_id)
         
         if node_id:
-            console.print(f"[bold blue]Watched Files for Node:[/bold blue] {node_id}")
+            console.print(f"[bold cyan]Watched files for node:[/bold cyan] {node_id}")
         else:
-            console.print("[bold blue]All Watched Files[/bold blue]")
+            console.print("[bold cyan]All watched files[/bold cyan]")
         
-        if not watch_info['watched_files']:
-            if node_id:
-                console.print(f"[yellow]No files being watched for node {node_id}[/yellow]")
-            else:
-                console.print("[yellow]No files being watched[/yellow]")
-            return
+        console.print(f"[bold blue]Total files:[/bold blue] {watched_data.get('total_files', 0)}")
+        if not node_id and 'total_watchers' in watched_data:
+            console.print(f"[bold blue]Total watchers:[/bold blue] {watched_data['total_watchers']}")
+        console.print()
         
-        table = Table()
-        table.add_column("File Path", style="cyan")
-        table.add_column("Watching Nodes", style="magenta")
-        table.add_column("Exists", style="green")
-        
-        for file_path, watching_nodes in watch_info['watched_files'].items():
-            exists = "Yes" if Path(file_path).exists() else "No"
-            nodes_str = ", ".join(watching_nodes)
+        if watched_data.get('watched_files'):
+            table = Table()
+            table.add_column("File Path", style="green")
+            table.add_column("Watching Nodes", style="cyan")
             
-            table.add_row(file_path, nodes_str, exists)
-        
-        console.print(table)
-        
-        if not node_id:
-            console.print(f"\n[blue]Total files watched:[/blue] {watch_info['total_files']}")
-            console.print(f"[blue]Total watchers:[/blue] {watch_info['total_watchers']}")
+            for file_path, watching_nodes in watched_data['watched_files'].items():
+                nodes_str = ", ".join(watching_nodes)
+                table.add_row(file_path, nodes_str)
+            
+            console.print(table)
+        else:
+            console.print("[yellow]No files are being watched[/yellow]")
         
     except Exception as e:
-        console.print(f"[red]Failed to show watched files: {e}[/red]")
+        console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
 
 
@@ -345,6 +477,47 @@ async def show_watched_files(ctx: click.Context, node_id: Optional[str]) -> None
 @handle_async
 async def show_file_inputs(ctx: click.Context, node_id: str) -> None:
     """Show file inputs for a specific node."""
+    # Try to connect to running daemon first
+    async with DaemonClient() as client:
+        if await client.is_daemon_running():
+            try:
+                file_inputs = await client.get_node_file_inputs(node_id)
+                
+                console.print(f"[bold cyan]File inputs for node:[/bold cyan] {node_id}")
+                console.print()
+                
+                if not file_inputs:
+                    console.print("[yellow]No file inputs found for this node[/yellow]")
+                    return
+                
+                table = Table()
+                table.add_column("Instance ID", style="cyan")
+                table.add_column("Input Name", style="magenta")
+                table.add_column("File Path", style="green")
+                table.add_column("Exists", style="yellow")
+                table.add_column("Watched", style="blue")
+                table.add_column("Output Path", style="white")
+                
+                for file_input in file_inputs:
+                    exists_str = "Yes" if file_input.get('exists', False) else "No"
+                    watched_str = "Yes" if file_input.get('is_watched', False) else "No"
+                    
+                    table.add_row(
+                        file_input.get('instance_id', 'Unknown'),
+                        file_input.get('input_name', 'Unknown'),
+                        file_input.get('file_path', 'Unknown'),
+                        exists_str,
+                        watched_str,
+                        file_input.get('output_path', 'Unknown')
+                    )
+                
+                console.print(table)
+                return
+            except Exception as e:
+                console.print(f"[red]Error connecting to daemon: {e}[/red]")
+                console.print("[yellow]Falling back to database query...[/yellow]")
+    
+    # Fallback to direct database access
     config_dir = ctx.obj.get('config_dir')
     daemon_instance = LivingTemplatesDaemon(config_dir)
     
@@ -352,7 +525,8 @@ async def show_file_inputs(ctx: click.Context, node_id: str) -> None:
         await daemon_instance.initialize()
         file_inputs = await daemon_instance.get_node_file_inputs(node_id)
         
-        console.print(f"[bold blue]File Inputs for Node:[/bold blue] {node_id}")
+        console.print(f"[bold cyan]File inputs for node:[/bold cyan] {node_id}")
+        console.print()
         
         if not file_inputs:
             console.print("[yellow]No file inputs found for this node[/yellow]")
@@ -361,28 +535,33 @@ async def show_file_inputs(ctx: click.Context, node_id: str) -> None:
         table = Table()
         table.add_column("Instance ID", style="cyan")
         table.add_column("Input Name", style="magenta")
-        table.add_column("File Path", style="blue")
-        table.add_column("Exists", style="green")
-        table.add_column("Watched", style="yellow")
-        table.add_column("Output Path", style="dim")
+        table.add_column("File Path", style="green")
+        table.add_column("Exists", style="yellow")
+        table.add_column("Watched", style="blue")
+        table.add_column("Output Path", style="white")
         
         for file_input in file_inputs:
-            exists = "Yes" if file_input['exists'] else "No"
-            watched = "Yes" if file_input['is_watched'] else "No"
+            exists_str = "Yes" if file_input.get('exists', False) else "No"
+            # Note: When using fallback, watched status may not be accurate
+            watched_str = "Unknown" if file_input.get('is_watched', False) else "No"
             
             table.add_row(
-                file_input['instance_id'][:8] + "...",  # Truncate instance ID
-                file_input['input_name'],
-                file_input['file_path'],
-                exists,
-                watched,
-                file_input['output_path']
+                file_input.get('instance_id', 'Unknown'),
+                file_input.get('input_name', 'Unknown'),
+                file_input.get('file_path', 'Unknown'),
+                exists_str,
+                watched_str,
+                file_input.get('output_path', 'Unknown')
             )
         
         console.print(table)
+        console.print("[dim]Note: Watched status may not be accurate when daemon is not running[/dim]")
         
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
     except Exception as e:
-        console.print(f"[red]Failed to show file inputs: {e}[/red]")
+        console.print(f"[red]Unexpected error: {e}[/red]")
         sys.exit(1)
 
 
