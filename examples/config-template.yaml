@@ -1,0 +1,40 @@
+---
+schema_version: "1.0"
+node_type: template
+template_engine: jinja2
+inputs:
+  app_name:
+    type: string
+    description: "Application name"
+  port:
+    type: integer
+    description: "Port number"
+    default: 8080
+  debug:
+    type: boolean
+    description: "Enable debug mode"
+    default: false
+  features:
+    type: array
+    description: "List of enabled features"
+    default: []
+  database_config:
+    type: file
+    description: "Database configuration file"
+    required: false
+outputs:
+  - config.json
+---
+{
+  "app": {
+    "name": "{{ app_name }}",
+    "port": {{ port }},
+    "debug": {{ debug | lower }},
+    "features": {{ features | tojson }}
+  },
+  "database": {% if database_config %}{{ database_config | read_file | trim }}{% else %}null{% endif %},
+  "generated": {
+    "timestamp": "{{ now() }}",
+    "version": "1.0.0"
+  }
+} 
