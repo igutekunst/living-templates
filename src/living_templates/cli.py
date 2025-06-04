@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import sys
+import traceback
 from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -104,6 +105,8 @@ async def start(ctx: click.Context, port: int, host: str) -> None:
             
     except Exception as e:
         console.print(f"[red]Failed to start daemon: {e}[/red]")
+        console.print(f"[red]Full traceback:[/red]")
+        console.print(traceback.format_exc())
         sys.exit(1)
 
 

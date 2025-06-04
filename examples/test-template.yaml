@@ -1,0 +1,27 @@
+---
+schema_version: "1.0"
+node_type: template
+template_engine: jinja2
+inputs:
+  title:
+    type: string
+    default: "Test Report"
+  data_source:
+    type: string
+    source: "@data-processor.summary"
+    description: "Summary from data processor"
+outputs:
+  - report.md
+---
+# {{ title }}
+
+Generated at: {{ now() | strftime('%Y-%m-%d %H:%M:%S') }}
+
+## Data Summary
+
+{{ data_source }}
+
+## Analysis
+
+This report was generated using data from the processor node.
+The analysis shows the processed results above. 

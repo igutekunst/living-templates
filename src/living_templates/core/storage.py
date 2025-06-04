@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import asyncio
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,6 +15,23 @@ from .models import (
     DependencyEdge, ExecutionLog, NodeConfig, NodeInstance, NodeValue, 
     OutputMode, TemplateNode, TailState, WebhookTrigger
 )
+
+
+class DatabaseRetry:
+    """Helper class for database retry logic."""
+    
+    @staticmethod
+    async def execute_with_retry(func, max_retries=3, base_delay=0.1):
+        """Execute database operation with exponential backoff retry."""
+        for attempt in range(max_retries):
+            try:
+                return await func()
+            except (sqlite3.OperationalError, aiosqlite.OperationalError) as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+                    continue
+                raise
 
 
 class ContentStore:
@@ -177,98 +195,116 @@ class Database:
     
     async def initialize(self) -> None:
         """Initialize database schema."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.executescript("""
-                CREATE TABLE IF NOT EXISTS nodes (
-                    id TEXT PRIMARY KEY,
-                    node_type TEXT NOT NULL,
-                    config_path TEXT,
-                    config_data TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
+        async def _init_db():
+            async with aiosqlite.connect(self.db_path) as db:
+                # Enable WAL mode for better concurrency
+                await db.execute("PRAGMA journal_mode=WAL")
+                await db.execute("PRAGMA synchronous=NORMAL")
+                await db.execute("PRAGMA busy_timeout=10000")  # 10 seconds
                 
-                CREATE TABLE IF NOT EXISTS node_instances (
-                    id TEXT PRIMARY KEY,
-                    node_id TEXT NOT NULL,
-                    input_config TEXT,
-                    output_path TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_built TIMESTAMP,
-                    build_count INTEGER DEFAULT 0,
-                    FOREIGN KEY (node_id) REFERENCES nodes(id)
-                );
-                
-                CREATE TABLE IF NOT EXISTS node_values (
-                    node_id TEXT,
-                    output_name TEXT,
-                    value_hash TEXT,
-                    value_data TEXT,
-                    content_path TEXT,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (node_id, output_name),
-                    FOREIGN KEY (node_id) REFERENCES nodes(id)
-                );
-                
-                CREATE TABLE IF NOT EXISTS dependencies (
-                    dependent_node_id TEXT,
-                    dependency_node_id TEXT,
-                    dependency_output TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (dependent_node_id, dependency_node_id, dependency_output),
-                    FOREIGN KEY (dependent_node_id) REFERENCES nodes(id),
-                    FOREIGN KEY (dependency_node_id) REFERENCES nodes(id)
-                );
-                
-                CREATE TABLE IF NOT EXISTS symlinks (
-                    target_path TEXT PRIMARY KEY,
-                    content_hash TEXT NOT NULL,
-                    node_instance_id TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (node_instance_id) REFERENCES node_instances(id)
-                );
-                
-                CREATE TABLE IF NOT EXISTS execution_logs (
-                    id TEXT PRIMARY KEY,
-                    node_id TEXT NOT NULL,
-                    instance_id TEXT,
-                    level TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    details TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (node_id) REFERENCES nodes(id),
-                    FOREIGN KEY (instance_id) REFERENCES node_instances(id)
-                );
-                
-                CREATE TABLE IF NOT EXISTS tail_states (
-                    node_id TEXT PRIMARY KEY,
-                    file_path TEXT NOT NULL,
-                    last_position INTEGER DEFAULT 0,
-                    last_inode INTEGER,
-                    buffer TEXT,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (node_id) REFERENCES nodes(id)
-                );
-                
-                CREATE TABLE IF NOT EXISTS webhook_triggers (
-                    id TEXT PRIMARY KEY,
-                    node_id TEXT NOT NULL,
-                    data TEXT NOT NULL,
-                    headers TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    processed BOOLEAN DEFAULT FALSE,
-                    FOREIGN KEY (node_id) REFERENCES nodes(id)
-                );
-                
-                CREATE INDEX IF NOT EXISTS idx_dependencies_dependent ON dependencies(dependent_node_id);
-                CREATE INDEX IF NOT EXISTS idx_dependencies_dependency ON dependencies(dependency_node_id);
-                CREATE INDEX IF NOT EXISTS idx_node_values_updated ON node_values(updated_at);
-                CREATE INDEX IF NOT EXISTS idx_execution_logs_node ON execution_logs(node_id);
-                CREATE INDEX IF NOT EXISTS idx_execution_logs_timestamp ON execution_logs(timestamp);
-                CREATE INDEX IF NOT EXISTS idx_webhook_triggers_node ON webhook_triggers(node_id);
-                CREATE INDEX IF NOT EXISTS idx_webhook_triggers_processed ON webhook_triggers(processed);
-            """)
-            await db.commit()
+                # Drop all existing tables to ensure clean schema
+                await db.executescript("""
+                    DROP TABLE IF EXISTS webhook_triggers;
+                    DROP TABLE IF EXISTS tail_states;
+                    DROP TABLE IF EXISTS execution_logs;
+                    DROP TABLE IF EXISTS symlinks;
+                    DROP TABLE IF EXISTS dependencies;
+                    DROP TABLE IF EXISTS node_values;
+                    DROP TABLE IF EXISTS node_instances;
+                    DROP TABLE IF EXISTS nodes;
+                    
+                    CREATE TABLE nodes (
+                        id TEXT PRIMARY KEY,
+                        node_type TEXT NOT NULL,
+                        config_path TEXT,
+                        config_data TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                    
+                    CREATE TABLE node_instances (
+                        id TEXT PRIMARY KEY,
+                        node_id TEXT NOT NULL,
+                        input_config TEXT,
+                        output_path TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_built TIMESTAMP,
+                        build_count INTEGER DEFAULT 0,
+                        FOREIGN KEY (node_id) REFERENCES nodes(id)
+                    );
+                    
+                    CREATE TABLE node_values (
+                        node_id TEXT,
+                        output_name TEXT,
+                        value_hash TEXT,
+                        value_data TEXT,
+                        content_path TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (node_id, output_name),
+                        FOREIGN KEY (node_id) REFERENCES nodes(id)
+                    );
+                    
+                    CREATE TABLE dependencies (
+                        dependent_node_id TEXT,
+                        dependency_node_id TEXT,
+                        dependency_output TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (dependent_node_id, dependency_node_id, dependency_output),
+                        FOREIGN KEY (dependent_node_id) REFERENCES nodes(id),
+                        FOREIGN KEY (dependency_node_id) REFERENCES nodes(id)
+                    );
+                    
+                    CREATE TABLE symlinks (
+                        target_path TEXT PRIMARY KEY,
+                        content_hash TEXT NOT NULL,
+                        node_instance_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (node_instance_id) REFERENCES node_instances(id)
+                    );
+                    
+                    CREATE TABLE execution_logs (
+                        id TEXT PRIMARY KEY,
+                        node_id TEXT NOT NULL,
+                        instance_id TEXT,
+                        level TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        details TEXT,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (node_id) REFERENCES nodes(id),
+                        FOREIGN KEY (instance_id) REFERENCES node_instances(id)
+                    );
+                    
+                    CREATE TABLE tail_states (
+                        node_id TEXT PRIMARY KEY,
+                        file_path TEXT NOT NULL,
+                        last_position INTEGER DEFAULT 0,
+                        last_inode INTEGER,
+                        buffer TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (node_id) REFERENCES nodes(id)
+                    );
+                    
+                    CREATE TABLE webhook_triggers (
+                        id TEXT PRIMARY KEY,
+                        node_id TEXT NOT NULL,
+                        data TEXT NOT NULL,
+                        headers TEXT,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        processed BOOLEAN DEFAULT FALSE,
+                        FOREIGN KEY (node_id) REFERENCES nodes(id)
+                    );
+                    
+                    CREATE INDEX idx_dependencies_dependent ON dependencies(dependent_node_id);
+                    CREATE INDEX idx_dependencies_dependency ON dependencies(dependency_node_id);
+                    CREATE INDEX idx_node_values_updated ON node_values(updated_at);
+                    CREATE INDEX idx_execution_logs_node ON execution_logs(node_id);
+                    CREATE INDEX idx_execution_logs_timestamp ON execution_logs(timestamp);
+                    CREATE INDEX idx_webhook_triggers_node ON webhook_triggers(node_id);
+                    CREATE INDEX idx_webhook_triggers_processed ON webhook_triggers(processed);
+                """)
+                await db.commit()
+        
+        await DatabaseRetry.execute_with_retry(_init_db)
     
     async def store_node(self, node: TemplateNode) -> None:
         """Store a node in the database."""
@@ -324,22 +360,25 @@ class Database:
         return nodes
     
     async def store_node_instance(self, instance: NodeInstance) -> None:
-        """Store a node instance."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                INSERT OR REPLACE INTO node_instances 
-                (id, node_id, input_config, output_path, created_at, last_built, build_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                instance.id,
-                instance.node_id,
-                json.dumps(instance.input_values),
-                instance.output_path,
-                instance.created_at.isoformat(),
-                instance.last_built.isoformat() if instance.last_built else None,
-                instance.build_count
-            ))
-            await db.commit()
+        """Store a node instance in the database."""
+        async def _store_instance():
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("PRAGMA busy_timeout=10000")
+                await db.execute("""
+                    INSERT OR REPLACE INTO node_instances (id, node_id, input_config, output_path, created_at, last_built, build_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    instance.id,
+                    instance.node_id,
+                    json.dumps(instance.input_values),
+                    instance.output_path,
+                    instance.created_at.isoformat(),
+                    instance.last_built.isoformat() if instance.last_built else None,
+                    instance.build_count
+                ))
+                await db.commit()
+        
+        await DatabaseRetry.execute_with_retry(_store_instance)
     
     async def get_node_instances(self, node_id: Optional[str] = None) -> List[NodeInstance]:
         """Get node instances."""
@@ -443,21 +482,25 @@ class Database:
             await db.commit()
     
     async def store_execution_log(self, log: ExecutionLog) -> None:
-        """Store an execution log entry."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                INSERT INTO execution_logs (id, node_id, instance_id, level, message, details, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                log.id,
-                log.node_id,
-                log.instance_id,
-                log.level.value,
-                log.message,
-                json.dumps(log.details) if log.details else None,
-                log.timestamp.isoformat()
-            ))
-            await db.commit()
+        """Store execution log in the database."""
+        async def _store_log():
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("PRAGMA busy_timeout=10000")
+                await db.execute("""
+                    INSERT INTO execution_logs (id, node_id, instance_id, level, message, details, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    log.id,
+                    log.node_id,
+                    log.instance_id,
+                    log.level.value,
+                    log.message,
+                    json.dumps(log.details) if log.details else None,
+                    log.timestamp.isoformat()
+                ))
+                await db.commit()
+        
+        await DatabaseRetry.execute_with_retry(_store_log)
     
     async def get_execution_logs(self, node_id: str, limit: int = 100) -> List[ExecutionLog]:
         """Get execution logs for a node."""

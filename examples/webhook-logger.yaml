@@ -1,0 +1,18 @@
+---
+schema_version: "1.0"
+node_type: webhook
+template_engine: jinja2
+inputs:
+  log_format:
+    type: string
+    default: "json"
+    description: "Format for webhook log output"
+outputs:
+  - webhook_log.txt
+output_mode: append
+---
+{% if log_format == "json" %}
+{{ {"timestamp": webhook_timestamp, "data": webhook_data, "headers": webhook_headers} | tojson }}
+{% else %}
+[{{ webhook_timestamp }}] Webhook received - Data: {{ webhook_data | string }} Headers: {{ webhook_headers | string }}
+{% endif %} 

@@ -15,7 +15,6 @@ requires-python = ">=3.8"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
@@ -56,6 +55,7 @@ lt-webhook-server = "living_templates.webhook_server:main"
 "Source" = "https://github.com/living-templates/living-templates"
 
 [tool.setuptools]
+package-dir = {"" = "src"}
 packages = ["living_templates", "living_templates.core"]
 
 [tool.setuptools_scm]

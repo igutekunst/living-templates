@@ -1,0 +1,20 @@
+---
+schema_version: "1.0"
+node_type: template
+template_engine: jinja2
+input_mode: tail
+inputs:
+  log_file:
+    type: file
+    description: "Log file to monitor"
+    required: true
+outputs:
+  - tail_output.txt
+output_mode: append
+tail_lines: 5
+---
+[{{ now() | strftime('%Y-%m-%d %H:%M:%S') }}] New lines detected:
+{% for line in new_lines %}
+{{ line }}
+{% endfor %}
+--- 

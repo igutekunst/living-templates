@@ -192,10 +192,6 @@ class LivingTemplatesDaemon:
         # Store in database
         await self.db.store_node(node)
         
-        # Watch the config file itself for changes
-        if config_path.exists():
-            self.file_watcher.add_file_watch(str(config_path.resolve()), node_id)
-        
         # Set up node-specific watchers
         await self._setup_node_watchers(node)
         
@@ -308,6 +304,17 @@ class LivingTemplatesDaemon:
         # Check if it's the config file itself
         node = await self.db.get_node(node_id)
         if node and node.config_path and str(node.config_path) == file_path:
+            # For program nodes, if the config file is the script file, we should reload but be careful about loops
+            if node.config.node_type == NodeType.PROGRAM and node.config.script_path:
+                script_path = Path(node.config.script_path)
+                if not script_path.is_absolute():
+                    script_path = Path.cwd() / script_path
+                
+                # If the config file is the same as the script file, avoid reload during execution
+                if str(script_path.resolve()) == str(Path(file_path).resolve()):
+                    await self._log(node_id, LogLevel.DEBUG, "Ignoring script file change during execution to prevent loops")
+                    return
+            
             # Config file changed, reload node
             try:
                 await self.unregister_node(node_id)
@@ -555,6 +562,27 @@ class LivingTemplatesDaemon:
     
     async def _setup_node_watchers(self, node: TemplateNode) -> None:
         """Set up watchers specific to node type."""
+        # For program nodes, only watch the config file if it's different from the script file
+        if node.config.node_type == NodeType.PROGRAM:
+            if node.config_path and node.config_path.exists():
+                # Check if config file is different from script file
+                if node.config.script_path:
+                    script_path = Path(node.config.script_path)
+                    if not script_path.is_absolute():
+                        script_path = Path.cwd() / script_path
+                    
+                    # Only watch config file if it's different from script file
+                    if str(node.config_path.resolve()) != str(script_path.resolve()):
+                        self.file_watcher.add_file_watch(str(node.config_path.resolve()), node.id)
+                else:
+                    # No script path, so watch config file
+                    self.file_watcher.add_file_watch(str(node.config_path.resolve()), node.id)
+        else:
+            # For non-program nodes, watch the config file normally
+            if node.config_path and node.config_path.exists():
+                self.file_watcher.add_file_watch(str(node.config_path.resolve()), node.id)
+        
+        # Set up node-type specific watching
         if node.config.node_type == NodeType.TAIL and node.config.input_mode == InputMode.TAIL:
             # Set up tail watching for file inputs
             for input_name, input_spec in node.config.inputs.items():
@@ -686,6 +714,9 @@ class LivingTemplatesDaemon:
                     self.symlink_manager.append_to_file(target_path, content)
                 elif node.config.output_mode == OutputMode.PREPEND:
                     self.symlink_manager.prepend_to_file(target_path, content)
+                elif node.config.output_mode == OutputMode.CONCATENATE:
+                    separator = "\n" if not content.endswith("\n") else ""
+                    self.symlink_manager.append_to_file(target_path, separator + content)
         elif len(output_files) > 1:
             # Multiple output files - copy to output directory
             target_path.mkdir(parents=True, exist_ok=True)
@@ -693,9 +724,32 @@ class LivingTemplatesDaemon:
                 src_path = Path(output_file)
                 if src_path.exists():
                     dst_path = target_path / src_path.name
-                    dst_path.write_text(src_path.read_text(encoding='utf-8'), encoding='utf-8')
+                    # Handle different output modes for multiple files
+                    content = src_path.read_text(encoding='utf-8')
+                    if node.config.output_mode == OutputMode.REPLACE:
+                        dst_path.write_text(content, encoding='utf-8')
+                    elif node.config.output_mode == OutputMode.APPEND:
+                        if dst_path.exists():
+                            existing_content = dst_path.read_text(encoding='utf-8')
+                            dst_path.write_text(existing_content + content, encoding='utf-8')
+                        else:
+                            dst_path.write_text(content, encoding='utf-8')
+                    elif node.config.output_mode == OutputMode.PREPEND:
+                        if dst_path.exists():
+                            existing_content = dst_path.read_text(encoding='utf-8')
+                            dst_path.write_text(content + existing_content, encoding='utf-8')
+                        else:
+                            dst_path.write_text(content, encoding='utf-8')
+                    elif node.config.output_mode == OutputMode.CONCATENATE:
+                        separator = "\n" if not content.endswith("\n") else ""
+                        if dst_path.exists():
+                            existing_content = dst_path.read_text(encoding='utf-8')
+                            dst_path.write_text(existing_content + separator + content, encoding='utf-8')
+                        else:
+                            dst_path.write_text(content, encoding='utf-8')
         
-        # Store node values
+        # Store node values for outputs that were generated
+        stored_values = 0
         for i, output_name in enumerate(node.config.outputs):
             if i < len(output_files):
                 output_file = Path(output_files[i])
@@ -708,6 +762,15 @@ class LivingTemplatesDaemon:
                         value_data=content
                     )
                     await self.db.store_node_value(value)
+                    stored_values += 1
+                    
+                    # Clean up the persistent temporary file
+                    try:
+                        output_file.unlink()
+                    except Exception as e:
+                        await self._log(node.id, LogLevel.DEBUG, f"Failed to cleanup temp file {output_file}: {e}")
+        
+        await self._log(node.id, LogLevel.INFO, f"Program instance completed: {stored_values} outputs stored")
     
     async def _build_webhook_instance(self, node: TemplateNode, instance: NodeInstance) -> None:
         """Build a webhook instance - essentially sets it up to receive triggers."""

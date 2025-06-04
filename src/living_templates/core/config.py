@@ -18,6 +18,18 @@ class FrontmatterParser:
         re.DOTALL | re.MULTILINE
     )
     
+    # Pattern for frontmatter inside Python docstrings
+    DOCSTRING_FRONTMATTER_PATTERN = re.compile(
+        r'^\s*(?:#!/[^\n]*\n)?(?:#[^\n]*\n)*\s*["\'"]{3}\s*\n---\s*\n(.*?)\n---\s*\n["\'"]{3}(.*)',
+        re.DOTALL | re.MULTILINE
+    )
+    
+    # Pattern for frontmatter inside comments
+    COMMENT_FRONTMATTER_PATTERN = re.compile(
+        r'^\s*(?:#!/[^\n]*\n)?(?:#.*\n)*#\s*---\s*\n((?:#.*\n)*?)#\s*---\s*\n(.*)',
+        re.DOTALL | re.MULTILINE
+    )
+    
     @classmethod
     def parse_file(cls, file_path: Path) -> Tuple[NodeConfig, str]:
         """Parse a file with YAML frontmatter.
@@ -38,19 +50,38 @@ class FrontmatterParser:
         Returns:
             Tuple of (NodeConfig, content)
         """
+        # Try standard frontmatter first
         match = cls.FRONTMATTER_PATTERN.match(content)
-        if not match:
-            raise ValueError("No valid YAML frontmatter found")
-        
-        frontmatter_yaml = match.group(1)
-        template_content = match.group(2)
+        if match:
+            frontmatter_yaml = match.group(1)
+            template_content = match.group(2)
+        else:
+            # Try docstring frontmatter (for Python files)
+            match = cls.DOCSTRING_FRONTMATTER_PATTERN.match(content)
+            if match:
+                frontmatter_yaml = match.group(1)
+                template_content = match.group(2)
+            else:
+                # Try comment frontmatter
+                match = cls.COMMENT_FRONTMATTER_PATTERN.match(content)
+                if match:
+                    # Extract YAML from comment lines
+                    comment_block = match.group(1)
+                    frontmatter_yaml = "\n".join(
+                        line.lstrip('#').strip() 
+                        for line in comment_block.split('\n') 
+                        if line.strip().startswith('#')
+                    )
+                    template_content = match.group(2)
+                else:
+                    raise ValueError("No valid YAML frontmatter found")
         
         try:
             frontmatter_data = yaml.safe_load(frontmatter_yaml)
         except yaml.YAMLError as e:
             raise ValueError(f"Invalid YAML in frontmatter: {e}")
         
-        # Add template content to the config
+        # Add template content to the config for template nodes
         if frontmatter_data.get('node_type') == 'template':
             frontmatter_data['template_content'] = template_content
         

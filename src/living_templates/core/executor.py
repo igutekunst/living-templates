@@ -172,7 +172,11 @@ class ProgramExecutor:
                     for output_name in node.config.outputs:
                         output_file = temp_path / output_name
                         if output_file.exists():
-                            output_files.append(str(output_file))
+                            # Copy to a persistent temporary file that won't be cleaned up
+                            persistent_temp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{output_name}")
+                            persistent_temp.write(output_file.read_bytes())
+                            persistent_temp.close()
+                            output_files.append(persistent_temp.name)
                         else:
                             logs.append(ExecutionLog(
                                 id=str(uuid.uuid4()),
