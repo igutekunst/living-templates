@@ -1,0 +1,36 @@
+---
+schema_version: "1.0"
+node_type: webhook
+inputs:
+  notification_format:
+    type: string
+    description: "Format for webhook notifications"
+    default: "json"
+  include_headers:
+    type: boolean
+    description: "Include HTTP headers in output"
+    default: false
+outputs:
+  - webhook_log.txt
+output_mode: append
+webhook_config:
+  max_payload_size: 1048576  # 1MB
+  allowed_methods:
+    - POST
+    - PUT
+  auth_required: false
+---
+{%- if webhook_data -%}
+{{ now() }} - Webhook Received:
+{% if notification_format == "json" %}
+{{ webhook_data | tojson(indent=2) }}
+{% else %}
+Data: {{ webhook_data }}
+{% endif %}
+{% if include_headers and webhook_headers %}
+Headers: {{ webhook_headers | tojson(indent=2) }}
+{% endif %}
+Timestamp: {{ webhook_timestamp }}
+---
+
+{% endif %} 

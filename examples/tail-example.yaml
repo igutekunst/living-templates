@@ -1,0 +1,36 @@
+---
+schema_version: "1.0"
+node_type: tail
+input_mode: tail
+inputs:
+  log_file:
+    type: file
+    description: "Log file to monitor"
+    required: true
+  alert_level:
+    type: string
+    description: "Log level to alert on"
+    default: "ERROR"
+outputs:
+  - alerts.log
+output_mode: append
+tail_lines: 50
+transform: |
+  import re
+  import json
+  
+  # Parse log line format: timestamp [level] message
+  match = re.match(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(\w+)\] (.+)', line)
+  if match and match.group(2) == alert_level:
+      result = json.dumps({
+          "timestamp": match.group(1),
+          "level": match.group(2), 
+          "message": match.group(3),
+          "alert_time": "{{ now() }}"
+      })
+  else:
+      result = None
+---
+{%- for line in new_lines if line -%}
+ALERT: {{ line }}
+{% endfor %} 

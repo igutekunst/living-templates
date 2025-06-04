@@ -15,6 +15,7 @@ class NodeType(str, Enum):
     FILE = "file"
     WEBHOOK = "webhook"
     MANUAL = "manual"
+    TAIL = "tail"
 
 
 class InputType(str, Enum):
@@ -34,6 +35,20 @@ class OutputMode(str, Enum):
     APPEND = "append"
     PREPEND = "prepend"
     CONCATENATE = "concatenate"
+
+
+class InputMode(str, Enum):
+    """Input modes for nodes."""
+    NORMAL = "normal"
+    TAIL = "tail"
+
+
+class LogLevel(str, Enum):
+    """Log levels."""
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
 
 
 class InputSpec(BaseModel):
@@ -61,6 +76,7 @@ class NodeConfig(BaseModel):
     dependencies: List[str] = Field(default_factory=list)
     template_engine: Optional[str] = "jinja2"
     output_mode: OutputMode = OutputMode.REPLACE
+    input_mode: InputMode = InputMode.NORMAL
     transform: Optional[str] = None
     
     # Template-specific
@@ -68,9 +84,17 @@ class NodeConfig(BaseModel):
     
     # Program-specific
     script_path: Optional[str] = None
+    command: Optional[str] = None
+    working_directory: Optional[str] = None
+    environment: Dict[str, str] = Field(default_factory=dict)
+    timeout: Optional[int] = 300  # 5 minutes default
     
     # Webhook-specific
     webhook_config: Optional[Dict[str, Any]] = None
+    
+    # Tail-specific
+    tail_lines: int = 10  # Number of lines to keep in memory for tail
+    tail_separator: str = "\n"
 
 
 class NodeInstance(BaseModel):
@@ -80,6 +104,8 @@ class NodeInstance(BaseModel):
     input_values: Dict[str, Any]
     output_path: str
     created_at: datetime = Field(default_factory=datetime.now)
+    last_built: Optional[datetime] = None
+    build_count: int = 0
 
 
 class NodeValue(BaseModel):
@@ -92,6 +118,29 @@ class NodeValue(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.now)
 
 
+class NodeReference(BaseModel):
+    """A reference to another node's output."""
+    node_id: str
+    output_name: str
+    
+    @classmethod
+    def parse_reference(cls, ref_string: str) -> 'NodeReference':
+        """Parse a reference string like '@node-id.output'."""
+        if not ref_string.startswith('@'):
+            raise ValueError(f"Node reference must start with '@': {ref_string}")
+        
+        ref_part = ref_string[1:]  # Remove @
+        if '.' not in ref_part:
+            raise ValueError(f"Node reference must contain '.': {ref_string}")
+        
+        node_id, output_name = ref_part.split('.', 1)
+        return cls(node_id=node_id, output_name=output_name)
+    
+    def to_string(self) -> str:
+        """Convert to string representation."""
+        return f"@{self.node_id}.{self.output_name}"
+
+
 class TemplateNode(BaseModel):
     """A template node with its configuration and content."""
     id: str
@@ -100,10 +149,14 @@ class TemplateNode(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     
     @validator('config')
-    def validate_template_config(cls, v: NodeConfig) -> NodeConfig:
-        """Validate template-specific configuration."""
+    def validate_node_config(cls, v: NodeConfig) -> NodeConfig:
+        """Validate node-specific configuration."""
         if v.node_type == NodeType.TEMPLATE and not v.template_content:
             raise ValueError("Template nodes must have template_content")
+        elif v.node_type == NodeType.PROGRAM and not (v.script_path or v.command):
+            raise ValueError("Program nodes must have script_path or command")
+        elif v.node_type == NodeType.WEBHOOK and not v.webhook_config:
+            raise ValueError("Webhook nodes must have webhook_config")
         return v
 
 
@@ -114,10 +167,39 @@ class DependencyEdge(BaseModel):
     dependency_output: str
 
 
+class ExecutionLog(BaseModel):
+    """Log entry for node execution."""
+    id: str
+    node_id: str
+    instance_id: Optional[str] = None
+    level: LogLevel
+    message: str
+    details: Optional[Dict[str, Any]] = None
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+
 class SystemStatus(BaseModel):
     """System status information."""
     daemon_running: bool
     active_nodes: int
     total_instances: int
     last_update: datetime
-    version: str 
+    version: str
+
+
+class TailState(BaseModel):
+    """State for tail nodes."""
+    node_id: str
+    file_path: str
+    last_position: int = 0
+    last_inode: Optional[int] = None
+    buffer: List[str] = Field(default_factory=list)
+    updated_at: datetime = Field(default_factory=datetime.now)
+
+
+class WebhookTrigger(BaseModel):
+    """Webhook trigger data."""
+    node_id: str
+    data: Dict[str, Any]
+    headers: Dict[str, str] = Field(default_factory=dict)
+    timestamp: datetime = Field(default_factory=datetime.now) 

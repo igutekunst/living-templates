@@ -15,11 +15,12 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from .core.daemon import LivingTemplatesDaemon, DaemonClient
+from .core.daemon import LivingTemplatesDaemon
 from .core.config import ConfigManager
 from .core.models import NodeType
 from .core.storage import ContentStore
 from .core.template_engine import TemplateEngine
+from .client import LivingTemplatesClient
 
 
 console = Console()
@@ -55,7 +56,7 @@ def daemon(ctx: click.Context) -> None:
 
 
 @daemon.command()
-@click.option('--port', default=8080, help='API server port')
+@click.option('--port', default=8765, help='API server port')
 @click.option('--host', default='127.0.0.1', help='API server host')
 @click.pass_context
 @handle_async
@@ -79,9 +80,13 @@ async def start(ctx: click.Context, port: int, host: str) -> None:
     console.print("[green]Starting Living Templates daemon...[/green]")
     
     try:
+        # Update daemon port
+        daemon_instance.api_port = port
+        
         await daemon_instance.start()
         console.print(f"[green]Daemon started successfully[/green]")
         console.print(f"PID: {os.getpid()}")
+        console.print(f"API server: http://{host}:{port}")
         console.print(f"Config directory: {daemon_instance.config_manager.config_dir}")
         
         # Set up signal handlers
@@ -155,6 +160,19 @@ def status(ctx: click.Context) -> None:
 @handle_async
 async def register(ctx: click.Context, config_file: Path) -> None:
     """Register a new template or node."""
+    # Try to connect to running daemon first
+    async with LivingTemplatesClient() as client:
+        if await client.is_daemon_running():
+            try:
+                node_id = await client.register_node(config_file)
+                console.print(f"[green]Registered node:[/green] {node_id}")
+                console.print(f"[blue]Config file:[/blue] {config_file}")
+                return
+            except Exception as e:
+                console.print(f"[red]Failed to register via daemon: {e}[/red]")
+                console.print("[yellow]Falling back to direct registration...[/yellow]")
+    
+    # Fall back to direct registration
     config_dir = ctx.obj.get('config_dir')
     daemon_instance = LivingTemplatesDaemon(config_dir)
     
@@ -174,6 +192,18 @@ async def register(ctx: click.Context, config_file: Path) -> None:
 @handle_async
 async def unregister(ctx: click.Context, node_id: str) -> None:
     """Unregister a node."""
+    # Try to connect to running daemon first
+    async with LivingTemplatesClient() as client:
+        if await client.is_daemon_running():
+            try:
+                await client.unregister_node(node_id)
+                console.print(f"[green]Unregistered node:[/green] {node_id}")
+                return
+            except Exception as e:
+                console.print(f"[red]Failed to unregister via daemon: {e}[/red]")
+                console.print("[yellow]Falling back to direct operation...[/yellow]")
+    
+    # Fall back to direct operation
     config_dir = ctx.obj.get('config_dir')
     daemon_instance = LivingTemplatesDaemon(config_dir)
     
@@ -192,7 +222,7 @@ async def unregister(ctx: click.Context, node_id: str) -> None:
 async def list_nodes(ctx: click.Context) -> None:
     """List all registered nodes."""
     # Try to connect to running daemon first
-    async with DaemonClient() as client:
+    async with LivingTemplatesClient() as client:
         if await client.is_daemon_running():
             try:
                 nodes_data = await client.list_nodes()
@@ -201,40 +231,42 @@ async def list_nodes(ctx: click.Context) -> None:
                     console.print("[yellow]No nodes registered[/yellow]")
                     return
                 
+                # Create table
                 table = Table(title="Registered Nodes")
                 table.add_column("Node ID", style="cyan")
                 table.add_column("Type", style="magenta")
-                table.add_column("Config File", style="blue")
-                table.add_column("Outputs", style="green")
-                table.add_column("Created", style="yellow")
+                table.add_column("Config Path", style="green")
+                table.add_column("Outputs", style="yellow")
+                table.add_column("Created", style="blue")
                 
-                for node_data in nodes_data:
-                    outputs_str = ", ".join(node_data.get("outputs", []))
-                    created_str = node_data.get("created_at", "Unknown")
-                    if created_str != "Unknown":
-                        # Format the datetime string
+                for node in nodes_data:
+                    outputs = ", ".join(node.get("outputs", []))
+                    created = node.get("created_at", "Unknown")
+                    if created and created != "Unknown":
+                        # Format datetime
                         from datetime import datetime
                         try:
-                            dt = datetime.fromisoformat(created_str.replace('Z', '+00:00'))
-                            created_str = dt.strftime("%Y-%m-%d %H:%M")
+                            dt = datetime.fromisoformat(created.replace('Z', '+00:00'))
+                            created = dt.strftime("%Y-%m-%d %H:%M")
                         except:
                             pass
                     
                     table.add_row(
-                        node_data["id"],
-                        node_data.get("node_type", "unknown"),
-                        node_data.get("config_path", "Unknown"),
-                        outputs_str,
-                        created_str
+                        node["id"],
+                        node["node_type"],
+                        node.get("config_path", "N/A"),
+                        outputs,
+                        created
                     )
                 
                 console.print(table)
                 return
+                
             except Exception as e:
-                console.print(f"[red]Error connecting to daemon: {e}[/red]")
-                console.print("[yellow]Falling back to database query...[/yellow]")
+                console.print(f"[red]Failed to get nodes from daemon: {e}[/red]")
+                console.print("[yellow]Falling back to direct access...[/yellow]")
     
-    # Fallback to direct database access
+    # Fall back to direct access
     config_dir = ctx.obj.get('config_dir')
     daemon_instance = LivingTemplatesDaemon(config_dir)
     
@@ -246,29 +278,30 @@ async def list_nodes(ctx: click.Context) -> None:
             console.print("[yellow]No nodes registered[/yellow]")
             return
         
+        # Create table
         table = Table(title="Registered Nodes")
         table.add_column("Node ID", style="cyan")
         table.add_column("Type", style="magenta")
-        table.add_column("Config File", style="blue")
-        table.add_column("Outputs", style="green")
-        table.add_column("Created", style="yellow")
+        table.add_column("Config Path", style="green")
+        table.add_column("Outputs", style="yellow")
+        table.add_column("Created", style="blue")
         
         for node in nodes:
-            outputs_str = ", ".join(node.config.outputs)
-            created_str = node.created_at.strftime("%Y-%m-%d %H:%M") if node.created_at else "Unknown"
+            outputs = ", ".join(node.config.outputs)
+            created = node.created_at.strftime("%Y-%m-%d %H:%M") if node.created_at else "Unknown"
             
             table.add_row(
                 node.id,
                 node.config.node_type.value,
-                str(node.config_path) if node.config_path else "Unknown",
-                outputs_str,
-                created_str
+                str(node.config_path) if node.config_path else "N/A",
+                outputs,
+                created
             )
         
         console.print(table)
         
     except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
+        console.print(f"[red]Failed to list nodes: {e}[/red]")
         sys.exit(1)
 
 
@@ -277,122 +310,52 @@ async def list_nodes(ctx: click.Context) -> None:
 @click.pass_context
 @handle_async
 async def show_inputs(ctx: click.Context, node_id: str) -> None:
-    """Show input specifications and current values for a node."""
-    # Try to connect to running daemon first
-    async with DaemonClient() as client:
+    """Show input specifications for a node."""
+    async with LivingTemplatesClient() as client:
         if await client.is_daemon_running():
             try:
                 inputs_data = await client.get_node_inputs(node_id)
                 
-                console.print(f"[bold cyan]Node:[/bold cyan] {inputs_data['node_id']}")
-                if inputs_data.get('config_path'):
-                    console.print(f"[bold blue]Config:[/bold blue] {inputs_data['config_path']}")
+                console.print(f"[bold cyan]Node:[/bold cyan] {node_id}")
+                console.print(f"[bold cyan]Type:[/bold cyan] {inputs_data.get('node_type', 'Unknown')}")
                 console.print()
                 
-                # Show input specifications
-                if inputs_data.get('input_specifications'):
-                    console.print("[bold green]Input Specifications:[/bold green]")
-                    spec_table = Table()
-                    spec_table.add_column("Input Name", style="cyan")
-                    spec_table.add_column("Type", style="magenta")
-                    spec_table.add_column("Required", style="yellow")
-                    spec_table.add_column("Default", style="blue")
-                    spec_table.add_column("Description", style="white")
-                    
-                    for input_name, spec in inputs_data['input_specifications'].items():
-                        required_str = "Yes" if spec.get('required', False) else "No"
-                        default_str = str(spec.get('default', '')) if spec.get('default') is not None else ""
-                        
-                        spec_table.add_row(
-                            input_name,
-                            spec.get('type', 'unknown'),
-                            required_str,
-                            default_str,
-                            spec.get('description', '')
-                        )
-                    
-                    console.print(spec_table)
-                    console.print()
+                if not inputs_data.get('inputs'):
+                    console.print("[yellow]No inputs defined[/yellow]")
+                    return
                 
-                # Show active instances
-                if inputs_data.get('active_instances'):
-                    console.print("[bold green]Active Instances:[/bold green]")
-                    for instance in inputs_data['active_instances']:
-                        console.print(f"[bold yellow]Instance:[/bold yellow] {instance['instance_id']}")
-                        console.print(f"[bold blue]Output:[/bold blue] {instance['output_path']}")
-                        
-                        if instance.get('input_values'):
-                            console.print("[bold green]Input Values:[/bold green]")
-                            for input_name, value in instance['input_values'].items():
-                                console.print(f"  {input_name}: {value}")
-                        console.print()
-                else:
-                    console.print("[yellow]No active instances[/yellow]")
+                # Create table
+                table = Table(title="Node Inputs")
+                table.add_column("Input Name", style="cyan")
+                table.add_column("Type", style="magenta")
+                table.add_column("Required", style="red")
+                table.add_column("Default", style="green")
+                table.add_column("Source", style="blue")
+                table.add_column("Description", style="yellow")
                 
+                for input_name, input_spec in inputs_data['inputs'].items():
+                    required = "Yes" if input_spec.get('required', True) else "No"
+                    default = str(input_spec.get('default', '')) if input_spec.get('default') is not None else ""
+                    source = input_spec.get('source', '')
+                    description = input_spec.get('description', '')
+                    
+                    table.add_row(
+                        input_name,
+                        input_spec['type'],
+                        required,
+                        default,
+                        source,
+                        description
+                    )
+                
+                console.print(table)
                 return
+                
             except Exception as e:
-                console.print(f"[red]Error connecting to daemon: {e}[/red]")
-                console.print("[yellow]Falling back to database query...[/yellow]")
+                console.print(f"[red]Failed to get node inputs: {e}[/red]")
+                return
     
-    # Fallback to direct database access
-    config_dir = ctx.obj.get('config_dir')
-    daemon_instance = LivingTemplatesDaemon(config_dir)
-    
-    try:
-        await daemon_instance.initialize()
-        inputs_data = await daemon_instance.get_node_inputs(node_id)
-        
-        console.print(f"[bold cyan]Node:[/bold cyan] {inputs_data['node_id']}")
-        if inputs_data.get('config_path'):
-            console.print(f"[bold blue]Config:[/bold blue] {inputs_data['config_path']}")
-        console.print()
-        
-        # Show input specifications
-        if inputs_data.get('input_specifications'):
-            console.print("[bold green]Input Specifications:[/bold green]")
-            spec_table = Table()
-            spec_table.add_column("Input Name", style="cyan")
-            spec_table.add_column("Type", style="magenta")
-            spec_table.add_column("Required", style="yellow")
-            spec_table.add_column("Default", style="blue")
-            spec_table.add_column("Description", style="white")
-            
-            for input_name, spec in inputs_data['input_specifications'].items():
-                required_str = "Yes" if spec.get('required', False) else "No"
-                default_str = str(spec.get('default', '')) if spec.get('default') is not None else ""
-                
-                spec_table.add_row(
-                    input_name,
-                    spec.get('type', 'unknown'),
-                    required_str,
-                    default_str,
-                    spec.get('description', '')
-                )
-            
-            console.print(spec_table)
-            console.print()
-        
-        # Show active instances
-        if inputs_data.get('active_instances'):
-            console.print("[bold green]Active Instances:[/bold green]")
-            for instance in inputs_data['active_instances']:
-                console.print(f"[bold yellow]Instance:[/bold yellow] {instance['instance_id']}")
-                console.print(f"[bold blue]Output:[/bold blue] {instance['output_path']}")
-                
-                if instance.get('input_values'):
-                    console.print("[bold green]Input Values:[/bold green]")
-                    for input_name, value in instance['input_values'].items():
-                        console.print(f"  {input_name}: {value}")
-                console.print()
-        else:
-            console.print("[yellow]No active instances[/yellow]")
-        
-    except ValueError as e:
-        console.print(f"[red]Error: {e}[/red]")
-        sys.exit(1)
-    except Exception as e:
-        console.print(f"[red]Unexpected error: {e}[/red]")
-        sys.exit(1)
+    console.print("[red]Daemon is not running[/red]")
 
 
 @main.command('show-watched-files')
@@ -400,75 +363,74 @@ async def show_inputs(ctx: click.Context, node_id: str) -> None:
 @click.pass_context
 @handle_async
 async def show_watched_files(ctx: click.Context, node_id: Optional[str]) -> None:
-    """Show files being watched by the daemon."""
-    # Try to connect to running daemon first
-    async with DaemonClient() as client:
+    """Show currently watched files."""
+    async with LivingTemplatesClient() as client:
         if await client.is_daemon_running():
             try:
                 watched_data = await client.get_watched_files(node_id)
                 
                 if node_id:
                     console.print(f"[bold cyan]Watched files for node:[/bold cyan] {node_id}")
-                else:
-                    console.print("[bold cyan]All watched files[/bold cyan]")
-                
-                console.print(f"[bold blue]Total files:[/bold blue] {watched_data.get('total_files', 0)}")
-                if not node_id and 'total_watchers' in watched_data:
-                    console.print(f"[bold blue]Total watchers:[/bold blue] {watched_data['total_watchers']}")
-                console.print()
-                
-                if watched_data.get('watched_files'):
-                    table = Table()
-                    table.add_column("File Path", style="green")
-                    table.add_column("Watching Nodes", style="cyan")
+                    console.print()
                     
-                    for file_path, watching_nodes in watched_data['watched_files'].items():
-                        nodes_str = ", ".join(watching_nodes)
-                        table.add_row(file_path, nodes_str)
+                    watched_files = watched_data.get('watched_files', [])
+                    if not watched_files:
+                        console.print("[yellow]No files watched by this node[/yellow]")
+                        return
+                    
+                    table = Table(title=f"Files watched by {node_id}")
+                    table.add_column("File Path", style="cyan")
+                    table.add_column("Exists", style="green")
+                    
+                    for file_info in watched_files:
+                        exists = "Yes" if file_info['exists'] else "No"
+                        table.add_row(file_info['file_path'], exists)
                     
                     console.print(table)
                 else:
-                    console.print("[yellow]No files are being watched[/yellow]")
+                    console.print("[bold cyan]All watched files:[/bold cyan]")
+                    console.print()
+                    
+                    file_watched = watched_data.get('file_watched', {})
+                    tail_watched = watched_data.get('tail_watched', {})
+                    
+                    if not file_watched and not tail_watched:
+                        console.print("[yellow]No files are being watched[/yellow]")
+                        return
+                    
+                    if file_watched:
+                        table = Table(title="File System Watches")
+                        table.add_column("File Path", style="cyan")
+                        table.add_column("Watching Nodes", style="magenta")
+                        table.add_column("Exists", style="green")
+                        
+                        for file_path, info in file_watched.items():
+                            nodes = ", ".join(info['watching_nodes'])
+                            exists = "Yes" if info['exists'] else "No"
+                            table.add_row(file_path, nodes, exists)
+                        
+                        console.print(table)
+                        console.print()
+                    
+                    if tail_watched:
+                        table = Table(title="Tail Watches")
+                        table.add_column("File Path", style="cyan")
+                        table.add_column("Type", style="magenta")
+                        table.add_column("Exists", style="green")
+                        
+                        for file_path, info in tail_watched.items():
+                            exists = "Yes" if info['exists'] else "No"
+                            table.add_row(file_path, info['type'], exists)
+                        
+                        console.print(table)
                 
                 return
+                
             except Exception as e:
-                console.print(f"[red]Error connecting to daemon: {e}[/red]")
-                console.print("[yellow]Falling back to database query...[/yellow]")
+                console.print(f"[red]Failed to get watched files: {e}[/red]")
+                return
     
-    # Fallback to direct database access
-    config_dir = ctx.obj.get('config_dir')
-    daemon_instance = LivingTemplatesDaemon(config_dir)
-    
-    try:
-        await daemon_instance.initialize()
-        watched_data = await daemon_instance.get_watched_files(node_id)
-        
-        if node_id:
-            console.print(f"[bold cyan]Watched files for node:[/bold cyan] {node_id}")
-        else:
-            console.print("[bold cyan]All watched files[/bold cyan]")
-        
-        console.print(f"[bold blue]Total files:[/bold blue] {watched_data.get('total_files', 0)}")
-        if not node_id and 'total_watchers' in watched_data:
-            console.print(f"[bold blue]Total watchers:[/bold blue] {watched_data['total_watchers']}")
-        console.print()
-        
-        if watched_data.get('watched_files'):
-            table = Table()
-            table.add_column("File Path", style="green")
-            table.add_column("Watching Nodes", style="cyan")
-            
-            for file_path, watching_nodes in watched_data['watched_files'].items():
-                nodes_str = ", ".join(watching_nodes)
-                table.add_row(file_path, nodes_str)
-            
-            console.print(table)
-        else:
-            console.print("[yellow]No files are being watched[/yellow]")
-        
-    except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
-        sys.exit(1)
+    console.print("[red]Daemon is not running[/red]")
 
 
 @main.command('show-file-inputs')
@@ -476,9 +438,8 @@ async def show_watched_files(ctx: click.Context, node_id: Optional[str]) -> None
 @click.pass_context
 @handle_async
 async def show_file_inputs(ctx: click.Context, node_id: str) -> None:
-    """Show file inputs for a specific node."""
-    # Try to connect to running daemon first
-    async with DaemonClient() as client:
+    """Show file inputs for a node."""
+    async with LivingTemplatesClient() as client:
         if await client.is_daemon_running():
             try:
                 file_inputs = await client.get_node_file_inputs(node_id)
@@ -487,104 +448,271 @@ async def show_file_inputs(ctx: click.Context, node_id: str) -> None:
                 console.print()
                 
                 if not file_inputs:
-                    console.print("[yellow]No file inputs found for this node[/yellow]")
+                    console.print("[yellow]No file inputs defined[/yellow]")
                     return
                 
-                table = Table()
-                table.add_column("Instance ID", style="cyan")
-                table.add_column("Input Name", style="magenta")
-                table.add_column("File Path", style="green")
-                table.add_column("Exists", style="yellow")
-                table.add_column("Watched", style="blue")
-                table.add_column("Output Path", style="white")
+                table = Table(title="File Inputs")
+                table.add_column("Input Name", style="cyan")
+                table.add_column("Required", style="red")
+                table.add_column("Default", style="green")
+                table.add_column("Description", style="yellow")
                 
                 for file_input in file_inputs:
-                    exists_str = "Yes" if file_input.get('exists', False) else "No"
-                    watched_str = "Yes" if file_input.get('is_watched', False) else "No"
+                    required = "Yes" if file_input.get('required', True) else "No"
+                    default = str(file_input.get('default', '')) if file_input.get('default') is not None else ""
+                    description = file_input.get('description', '')
                     
                     table.add_row(
-                        file_input.get('instance_id', 'Unknown'),
-                        file_input.get('input_name', 'Unknown'),
-                        file_input.get('file_path', 'Unknown'),
-                        exists_str,
-                        watched_str,
-                        file_input.get('output_path', 'Unknown')
+                        file_input['input_name'],
+                        required,
+                        default,
+                        description
                     )
                 
                 console.print(table)
                 return
+                
             except Exception as e:
-                console.print(f"[red]Error connecting to daemon: {e}[/red]")
-                console.print("[yellow]Falling back to database query...[/yellow]")
+                console.print(f"[red]Failed to get file inputs: {e}[/red]")
+                return
     
-    # Fallback to direct database access
-    config_dir = ctx.obj.get('config_dir')
-    daemon_instance = LivingTemplatesDaemon(config_dir)
-    
-    try:
-        await daemon_instance.initialize()
-        file_inputs = await daemon_instance.get_node_file_inputs(node_id)
-        
-        console.print(f"[bold cyan]File inputs for node:[/bold cyan] {node_id}")
-        console.print()
-        
-        if not file_inputs:
-            console.print("[yellow]No file inputs found for this node[/yellow]")
-            return
-        
-        table = Table()
-        table.add_column("Instance ID", style="cyan")
-        table.add_column("Input Name", style="magenta")
-        table.add_column("File Path", style="green")
-        table.add_column("Exists", style="yellow")
-        table.add_column("Watched", style="blue")
-        table.add_column("Output Path", style="white")
-        
-        for file_input in file_inputs:
-            exists_str = "Yes" if file_input.get('exists', False) else "No"
-            # Note: When using fallback, watched status may not be accurate
-            watched_str = "Unknown" if file_input.get('is_watched', False) else "No"
-            
-            table.add_row(
-                file_input.get('instance_id', 'Unknown'),
-                file_input.get('input_name', 'Unknown'),
-                file_input.get('file_path', 'Unknown'),
-                exists_str,
-                watched_str,
-                file_input.get('output_path', 'Unknown')
-            )
-        
-        console.print(table)
-        console.print("[dim]Note: Watched status may not be accurate when daemon is not running[/dim]")
-        
-    except ValueError as e:
-        console.print(f"[red]Error: {e}[/red]")
-        sys.exit(1)
-    except Exception as e:
-        console.print(f"[red]Unexpected error: {e}[/red]")
-        sys.exit(1)
+    console.print("[red]Daemon is not running[/red]")
 
 
 @main.command()
 @click.argument('config_file', type=click.Path(exists=True, path_type=Path))
 @click.pass_context
 def validate(ctx: click.Context, config_file: Path) -> None:
-    """Validate a configuration file."""
-    config_dir = ctx.obj.get('config_dir')
-    config_manager = ConfigManager(config_dir)
-    
+    """Validate a node configuration file."""
     try:
+        config_manager = ConfigManager()
         config, content = config_manager.load_node_config(config_file)
+        
         console.print(f"[green]✓ Configuration is valid[/green]")
         console.print(f"[blue]Node type:[/blue] {config.node_type.value}")
-        console.print(f"[blue]Outputs:[/blue] {', '.join(config.outputs)}")
         console.print(f"[blue]Inputs:[/blue] {len(config.inputs)}")
+        console.print(f"[blue]Outputs:[/blue] {len(config.outputs)}")
+        
+        if config.inputs:
+            console.print("\n[bold]Inputs:[/bold]")
+            for input_name, input_spec in config.inputs.items():
+                required = " (required)" if input_spec.required else " (optional)"
+                console.print(f"  • {input_name}: {input_spec.type.value}{required}")
+        
+        if config.outputs:
+            console.print("\n[bold]Outputs:[/bold]")
+            for output in config.outputs:
+                console.print(f"  • {output}")
+        
     except Exception as e:
         console.print(f"[red]✗ Configuration is invalid: {e}[/red]")
         sys.exit(1)
 
 
-# Short form CLI (lt command)
+@main.command()
+@click.argument('node_id')
+@click.pass_context
+@handle_async
+async def rebuild(ctx: click.Context, node_id: str) -> None:
+    """Force rebuild a node's instances."""
+    async with LivingTemplatesClient() as client:
+        if await client.is_daemon_running():
+            try:
+                await client.rebuild_node(node_id)
+                console.print(f"[green]Rebuilt node instances:[/green] {node_id}")
+                return
+            except Exception as e:
+                console.print(f"[red]Failed to rebuild node: {e}[/red]")
+                return
+    
+    console.print("[red]Daemon is not running[/red]")
+
+
+@main.command()
+@click.option('--node-id', help='Show graph for specific node only')
+@click.option('--format', 'output_format', default='text', 
+              type=click.Choice(['text', 'json']), help='Output format')
+@click.pass_context
+@handle_async
+async def graph(ctx: click.Context, node_id: Optional[str], output_format: str) -> None:
+    """Show dependency graph."""
+    async with LivingTemplatesClient() as client:
+        if await client.is_daemon_running():
+            try:
+                graph_data = await client.get_dependency_graph(node_id)
+                
+                if output_format == 'json':
+                    console.print(json.dumps(graph_data, indent=2))
+                    return
+                
+                nodes = graph_data.get('nodes', [])
+                edges = graph_data.get('edges', [])
+                
+                if not nodes:
+                    console.print("[yellow]No nodes in graph[/yellow]")
+                    return
+                
+                # Show nodes
+                console.print("[bold cyan]Nodes:[/bold cyan]")
+                table = Table()
+                table.add_column("Node ID", style="cyan")
+                table.add_column("Type", style="magenta")
+                table.add_column("Outputs", style="yellow")
+                table.add_column("Config Path", style="green")
+                
+                for node in nodes:
+                    outputs = ", ".join(node.get('outputs', []))
+                    config_path = node.get('config_path', 'N/A')
+                    
+                    table.add_row(
+                        node['id'],
+                        node['type'],
+                        outputs,
+                        config_path
+                    )
+                
+                console.print(table)
+                
+                # Show dependencies
+                if edges:
+                    console.print("\n[bold cyan]Dependencies:[/bold cyan]")
+                    dep_table = Table()
+                    dep_table.add_column("From Node", style="green")
+                    dep_table.add_column("Output", style="yellow")
+                    dep_table.add_column("To Node", style="cyan")
+                    
+                    for edge in edges:
+                        dep_table.add_row(
+                            edge['from'],
+                            edge['output'],
+                            edge['to']
+                        )
+                    
+                    console.print(dep_table)
+                else:
+                    console.print("\n[yellow]No dependencies found[/yellow]")
+                
+                return
+                
+            except Exception as e:
+                console.print(f"[red]Failed to get dependency graph: {e}[/red]")
+                return
+    
+    console.print("[red]Daemon is not running[/red]")
+
+
+@main.command('logs')
+@click.argument('node_id')
+@click.option('--limit', default=50, help='Number of log entries to show')
+@click.option('--level', type=click.Choice(['debug', 'info', 'warning', 'error']),
+              help='Filter by log level')
+@click.pass_context
+@handle_async
+async def logs(ctx: click.Context, node_id: str, limit: int, level: Optional[str]) -> None:
+    """Show execution logs for a node."""
+    async with LivingTemplatesClient() as client:
+        if await client.is_daemon_running():
+            try:
+                logs_data = await client.get_node_logs(node_id, limit)
+                
+                if not logs_data:
+                    console.print(f"[yellow]No logs found for node:[/yellow] {node_id}")
+                    return
+                
+                # Filter by level if specified
+                if level:
+                    logs_data = [log for log in logs_data if log['level'].lower() == level.lower()]
+                
+                console.print(f"[bold cyan]Logs for node:[/bold cyan] {node_id}")
+                console.print()
+                
+                for log in logs_data:
+                    # Color code by level
+                    level_colors = {
+                        'debug': 'blue',
+                        'info': 'green',
+                        'warning': 'yellow',
+                        'error': 'red'
+                    }
+                    level_color = level_colors.get(log['level'].lower(), 'white')
+                    
+                    timestamp = log['timestamp']
+                    try:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                        timestamp = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    except:
+                        pass
+                    
+                    console.print(f"[{level_color}]{timestamp} [{log['level'].upper()}][/{level_color}] {log['message']}")
+                    
+                    if log.get('details') and isinstance(log['details'], dict):
+                        for key, value in log['details'].items():
+                            console.print(f"  {key}: {value}")
+                    
+                    console.print()
+                
+                return
+                
+            except Exception as e:
+                console.print(f"[red]Failed to get logs: {e}[/red]")
+                return
+    
+    console.print("[red]Daemon is not running[/red]")
+
+
+@main.command('list-instances')
+@click.option('--node-id', help='Filter by node ID')
+@click.pass_context
+@handle_async
+async def list_instances(ctx: click.Context, node_id: Optional[str]) -> None:
+    """List node instances."""
+    async with LivingTemplatesClient() as client:
+        if await client.is_daemon_running():
+            try:
+                instances_data = await client.list_instances(node_id)
+                
+                if not instances_data:
+                    filter_msg = f" for node {node_id}" if node_id else ""
+                    console.print(f"[yellow]No instances found{filter_msg}[/yellow]")
+                    return
+                
+                title = f"Instances for node {node_id}" if node_id else "All Instances"
+                table = Table(title=title)
+                table.add_column("Instance ID", style="cyan")
+                table.add_column("Node ID", style="magenta")
+                table.add_column("Output Path", style="green")
+                table.add_column("Build Count", style="yellow")
+                table.add_column("Last Built", style="blue")
+                
+                for instance in instances_data:
+                    last_built = instance.get('last_built', 'Never')
+                    if last_built and last_built != 'Never':
+                        try:
+                            from datetime import datetime
+                            dt = datetime.fromisoformat(last_built.replace('Z', '+00:00'))
+                            last_built = dt.strftime("%Y-%m-%d %H:%M:%S")
+                        except:
+                            pass
+                    
+                    table.add_row(
+                        instance['id'][:12] + "...",  # Truncate ID for display
+                        instance['node_id'],
+                        instance['output_path'],
+                        str(instance.get('build_count', 0)),
+                        last_built
+                    )
+                
+                console.print(table)
+                return
+                
+            except Exception as e:
+                console.print(f"[red]Failed to get instances: {e}[/red]")
+                return
+    
+    console.print("[red]Daemon is not running[/red]")
+
+
 @click.command()
 @click.option('-s', '--source', 'template_file', required=True,
               type=click.Path(exists=True, path_type=Path),
@@ -612,79 +740,121 @@ async def lt_main(
     dry_run: bool,
     config_dir: Optional[Path]
 ) -> None:
-    """Create a living template instance.
+    """Create an instance of a template with specific inputs (lt command)."""
     
-    TEMPLATE_FILE: Path to the template configuration file
-    OUTPUT_PATH: Where to create the generated file
-    """
-    daemon_instance = LivingTemplatesDaemon(config_dir)
+    # Parse input values
+    input_values = {}
+    
+    # Load from config file if provided
+    if config_file:
+        try:
+            with open(config_file, 'r') as f:
+                if config_file.suffix.lower() in ['.yaml', '.yml']:
+                    config_data = yaml.safe_load(f)
+                else:
+                    config_data = json.load(f)
+            
+            if 'inputs' in config_data:
+                input_values.update(config_data['inputs'])
+            else:
+                input_values.update(config_data)
+                
+        except Exception as e:
+            console.print(f"[red]Failed to load config file: {e}[/red]")
+            sys.exit(1)
+    
+    # Parse command line inputs (these override config file)
+    for input_str in inputs:
+        if '=' not in input_str:
+            console.print(f"[red]Invalid input format: {input_str}[/red]")
+            console.print("Use format: key=value")
+            sys.exit(1)
+        
+        key, value = input_str.split('=', 1)
+        
+        # Try to parse as JSON for complex types
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            # Keep as string
+            pass
+        
+        input_values[key] = value
     
     try:
-        await daemon_instance.initialize()
+        # Try daemon first
+        async with LivingTemplatesClient() as client:
+            if await client.is_daemon_running():
+                try:
+                    # Register node if not already registered
+                    node_id = await client.register_node(template_file)
+                    
+                    if dry_run:
+                        console.print(f"[yellow]Would create instance:[/yellow]")
+                        console.print(f"  Template: {template_file}")
+                        console.print(f"  Output: {output_path}")
+                        console.print(f"  Inputs: {input_values}")
+                        return
+                    
+                    # Create instance
+                    instance_id = await client.create_instance(node_id, str(output_path), input_values)
+                    
+                    console.print(f"[green]✓ Instance created successfully[/green]")
+                    console.print(f"Node ID: {node_id}")
+                    console.print(f"Instance ID: {instance_id}")
+                    console.print(f"Output: {output_path}")
+                    return
+                    
+                except Exception as e:
+                    console.print(f"[red]Failed via daemon: {e}[/red]")
+                    console.print("[yellow]Falling back to direct processing...[/yellow]")
         
-        # Parse input values
-        input_values = {}
-        
-        # Load from config file if provided
-        if config_file:
-            if config_file.suffix.lower() in ['.yaml', '.yml']:
-                with open(config_file) as f:
-                    file_inputs = yaml.safe_load(f)
-                    if 'inputs' in file_inputs:
-                        input_values.update(file_inputs['inputs'])
-                    else:
-                        input_values.update(file_inputs)
-            elif config_file.suffix.lower() == '.json':
-                with open(config_file) as f:
-                    file_inputs = json.load(f)
-                    if 'inputs' in file_inputs:
-                        input_values.update(file_inputs['inputs'])
-                    else:
-                        input_values.update(file_inputs)
-        
-        # Parse CLI input arguments
-        for input_arg in inputs:
-            if '=' not in input_arg:
-                console.print(f"[red]Invalid input format: {input_arg}[/red]")
-                console.print("Use format: --input key=value")
-                sys.exit(1)
-            
-            key, value = input_arg.split('=', 1)
-            # Try to parse as JSON for complex types
-            try:
-                input_values[key] = json.loads(value)
-            except json.JSONDecodeError:
-                input_values[key] = value
-        
+        # Fall back to direct processing
         if dry_run:
-            console.print("[yellow]Dry run mode - no files will be created[/yellow]")
-            console.print(f"[blue]Template:[/blue] {template_file}")
-            console.print(f"[blue]Output:[/blue] {output_path}")
-            console.print(f"[blue]Inputs:[/blue] {json.dumps(input_values, indent=2)}")
+            console.print(f"[yellow]Would create instance:[/yellow]")
+            console.print(f"  Template: {template_file}")
+            console.print(f"  Output: {output_path}")
+            console.print(f"  Inputs: {input_values}")
             return
         
-        # Register node if not already registered
-        node_id = await daemon_instance.register_node(template_file)
+        # Direct template processing
+        config_manager = ConfigManager(config_dir)
+        config, content = config_manager.load_node_config(template_file)
         
-        # Create instance
-        instance_id = await daemon_instance.create_instance(
-            node_id,
-            str(output_path),
-            input_values
-        )
+        if config.node_type != NodeType.TEMPLATE:
+            console.print(f"[red]Node type {config.node_type.value} not supported in direct mode[/red]")
+            console.print("Start the daemon to use all node types.")
+            sys.exit(1)
         
-        console.print(f"[green]✓ Created template instance[/green]")
-        console.print(f"[blue]Node ID:[/blue] {node_id}")
-        console.print(f"[blue]Instance ID:[/blue] {instance_id}")
-        console.print(f"[blue]Output:[/blue] {output_path}")
+        # Validate required inputs
+        for input_name, input_spec in config.inputs.items():
+            if input_spec.required and input_name not in input_values:
+                if input_spec.default is not None:
+                    input_values[input_name] = input_spec.default
+                else:
+                    console.print(f"[red]Required input missing: {input_name}[/red]")
+                    sys.exit(1)
         
-        if output_path.exists():
-            console.print(f"[green]✓ Generated file created successfully[/green]")
+        # Render template
+        template_engine = TemplateEngine()
+        rendered_content = template_engine.render(content, input_values)
+        
+        # Write output
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(rendered_content, encoding='utf-8')
+        
+        console.print(f"[green]✓ Template rendered successfully[/green]")
+        console.print(f"Output written to: {output_path}")
         
     except Exception as e:
-        console.print(f"[red]Failed to create template instance: {e}[/red]")
+        console.print(f"[red]Failed to process template: {e}[/red]")
         sys.exit(1)
 
 
-if __name__ == '__main__':
-    main() 
+if __name__ == "__main__":
+    # Register the lt command
+    import sys
+    if len(sys.argv) > 0 and 'lt' in sys.argv[0]:
+        lt_main()
+    else:
+        main() 
